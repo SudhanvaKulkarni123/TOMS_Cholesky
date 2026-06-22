@@ -6,21 +6,19 @@
  *
  * Preconditioners:
  *   0) None (plain CG)
- *   1) cuSOLVER Spotrf (FP32)
+ *   1) cuSOLVER Dpotrf (FP64) cast back to FP32
  *   2) Mixed FP16 Cholesky  (cuBLASLt FP16 GEMM, FP32 accum/output)
- *   3) Mixed FP8 Cholesky   (cuBLASLt FP8 tensorwise GEMM, FP32 accum/output)
- *   4) Mixed FP8 Cholesky   (cuBLASLt FP8 block-scaled GEMM, FP32 accum/output)
- *   5) Adaptive-precision Hybrid Cholesky (per-step precision selection)
+ *   3) Adaptive-precision Hybrid Cholesky (per-step precision selection)
+ *      - Low-precision path uses cuBLASLt FP8 with 1-D block scaling
+ *        (128 along K, 1 along M/N) → row-scaled MX-style
  *
- * CG runs in FP32.  Each preconditioner L is computed in FP32 (or mixed).
- * Preconditioner application:  z = L^{-T}(L^{-1} r)
- * via two cuBLAS FP32 triangular solves.
+ * CG runs in FP32 or FP64 depending on path.
  *
  * Test matrix:  A = Q diag(λ) Q^T   with eigenvalues from 1 to 1/κ
  * under various distributions.  Built as FP64 then cast to FP32.
  *
- * Build (sm_90a, CUTLASS 3.7+):
- *   nvcc -std=c++17 -O3 -arch=sm_90a -Xptxas --allow-expensive-optimizations=true --expt-relaxed-constexpr -I../cutlass/include  -I../cutlass/tools/util/include  pcg_bench.cu mmio.c  -lcusolver -lcublas -lcurand -o pcg_bench
+ * Build (sm_90a, CUDA 12.9+ required for FP8 1-D block scaling):
+ *   nvcc -std=c++17 -O3 -arch=sm_90a -Xptxas --allow-expensive-optimizations=true --expt-relaxed-constexpr pcg_bench.cu mmio.c -lcusolver -lcublas -lcublasLt -lcurand -o pcg_bench
  *
  * Run:
  *   ./pcg_bench --n 4096 --nb 256 --cond 1e6
@@ -35,52 +33,85 @@
 #include <algorithm>
 #include <cfloat>
 #include <string>
+#include <unordered_map>
+#include <cstdint>
 
 #include <cuda_runtime.h>
 #include <cuda_fp8.h>
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include <cusolverDn.h>
 #include <cublas_v2.h>
 #include <cublasLt.h>
 #include <curand.h>
 
-
-#include <cutlass/cutlass.h>
-#include <cutlass/numeric_types.h>
-#include <cute/tensor.hpp>
-#include <cutlass/gemm/dispatch_policy.hpp>
-#include <cutlass/gemm/device/gemm_universal_adapter.h>
-#include <cutlass/gemm/kernel/gemm_universal.hpp>
-#include <cutlass/gemm/collective/collective_builder.hpp>
-#include <cutlass/epilogue/dispatch_policy.hpp>
-#include <cutlass/epilogue/collective/collective_builder.hpp>
-#include <cutlass/detail/blockwise_scale_layout.hpp>
-#include <cutlass/util/packed_stride.hpp>
-
 extern "C" {
 #include "mmio.h"
 }
-
-using namespace cute;
 
 #define QUANT_TILE 32
 
 #define COUNT_UNDERFLOW
 
-// ─── Small kernel: x[i] -= 1.0  (for forward-error vs exact solution = ones) ──
-__global__ void subtract_ones_f64_kernel(double* __restrict__ x, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) x[i] -= 1.0;
-}
+// ─── Error macros ────────────────────────────────────────────────
+#define CUDA_CHECK(call) do {                                      \
+    cudaError_t e = (call);                                        \
+    if (e != cudaSuccess) {                                        \
+        fprintf(stderr, "CUDA %s:%d: %s\n",                        \
+                __FILE__, __LINE__, cudaGetErrorString(e));        \
+        exit(1);                                                   \
+    }                                                              \
+} while (0)
+
+#define CUSOLVER_CHECK(call) do {                                  \
+    cusolverStatus_t s = (call);                                   \
+    if (s != CUSOLVER_STATUS_SUCCESS) {                            \
+        fprintf(stderr, "cuSOLVER %s:%d: %d\n",                    \
+                __FILE__, __LINE__, (int)s); exit(1);              \
+    }                                                              \
+} while (0)
+
+#define CUBLAS_CHECK(call) do {                                    \
+    cublasStatus_t s = (call);                                     \
+    if (s != CUBLAS_STATUS_SUCCESS) {                              \
+        fprintf(stderr, "cuBLAS %s:%d: %d\n",                      \
+                __FILE__, __LINE__, (int)s); exit(1);              \
+    }                                                              \
+} while (0)
+
+#define CURAND_CHECK(call) do {                                    \
+    curandStatus_t s = (call);                                     \
+    if (s != CURAND_STATUS_SUCCESS) {                              \
+        fprintf(stderr, "cuRAND %s:%d: %d\n",                      \
+                __FILE__, __LINE__, (int)s); exit(1);              \
+    }                                                              \
+} while (0)
+
+// ═══════════════════════════════════════════════════════════════════
+//  Scale-mode enum names changed during cuBLAS 12.9 development.
+//  The release name in 12.9+ headers is CUBLASLT_MATMUL_MATRIX_SCALE_VEC128_32F
+//  (the "VEC128" refers to one FP32 scale per 128-element vector along K).
+//  For older preview headers or different toolkit minor versions, the
+//  spelling may be CUBLASLT_MATMUL_MATRIX_SCALE_BLK128_1D_32F or
+//  CUBLASLT_MATMUL_MATRIX_SCALE_BLK128_OUTER_VEC_32F.  Add fallbacks.
+//  Check with:  grep MATMUL_MATRIX_SCALE_ /usr/local/cuda/include/cublasLt.h
+// ═══════════════════════════════════════════════════════════════════
+#if !defined(CUBLASLT_MATMUL_MATRIX_SCALE_VEC128_32F)
+  #if defined(CUBLASLT_MATMUL_MATRIX_SCALE_BLK128_1D_32F)
+    #define CUBLASLT_MATMUL_MATRIX_SCALE_VEC128_32F \
+            CUBLASLT_MATMUL_MATRIX_SCALE_BLK128_1D_32F
+  #elif defined(CUBLASLT_MATMUL_MATRIX_SCALE_BLK128_OUTER_VEC_32F)
+    #define CUBLASLT_MATMUL_MATRIX_SCALE_VEC128_32F \
+            CUBLASLT_MATMUL_MATRIX_SCALE_BLK128_OUTER_VEC_32F
+  #endif
+#endif
 
 // ─── Small kernel: random normal init for Lanczos starting vector ───────────
 __global__ void init_lanczos_start_kernel(double* __restrict__ v, int n, unsigned seed) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    // simple hash-based PRNG — good enough for Lanczos start vectors
     unsigned h = (unsigned)i * 2654435761u + seed;
     h ^= h >> 16; h *= 0x85ebca6bu; h ^= h >> 13; h *= 0xc2b2ae35u; h ^= h >> 16;
-    // map to uniform in [-1, 1)
     v[i] = ((double)h / 2147483648.0) - 1.0;
 }
 
@@ -101,45 +132,18 @@ static inline int vec_has_nan_f64(const double* d_v, size_t n) {
     return h_flag;
 }
 
-
-static inline double compute_forward_error_from_ones(
-        const double* d_x, int n, cublasHandle_t blas)
-{
-    double* d_err;
-    cudaMalloc(&d_err, sizeof(double) * n);
-    cudaMemcpy(d_err, d_x, sizeof(double) * n, cudaMemcpyDeviceToDevice);
-
-    int bl = 256, gr = (n + bl - 1) / bl;
-    subtract_ones_f64_kernel<<<gr, bl>>>(d_err, n);
-
-    cublasPointerMode_t old_mode;
-    cublasGetPointerMode(blas, &old_mode);
-    cublasSetPointerMode(blas, CUBLAS_POINTER_MODE_HOST);
-
-    double norm_err = 0.0;
-    cublasDnrm2(blas, n, d_err, 1, &norm_err);
-
-    cublasSetPointerMode(blas, old_mode);
-    cudaFree(d_err);
-
-    return norm_err / std::sqrt((double)n);
-}
-
-
 static inline double compute_true_residual(
         const double* d_A, const double* d_b, const double* d_x,
         int n, cublasHandle_t blas)
 {
     double* d_r;
     cudaMalloc(&d_r, sizeof(double) * n);
-    // r = b
     cudaMemcpy(d_r, d_b, sizeof(double) * n, cudaMemcpyDeviceToDevice);
 
     cublasPointerMode_t old_mode;
     cublasGetPointerMode(blas, &old_mode);
     cublasSetPointerMode(blas, CUBLAS_POINTER_MODE_HOST);
 
-    // r = b - A*x
     double neg = -1.0, one = 1.0;
     cublasDgemv(blas, CUBLAS_OP_N, n, n, &neg, d_A, n, d_x, 1, &one, d_r, 1);
 
@@ -153,6 +157,483 @@ static inline double compute_true_residual(
     return (norm_b > 0) ? norm_r / norm_b : norm_r;
 }
 
+// ═══════════════════════════════════════════════════════════════════
+//  cuBLASLt persistent context & GEMM launchers
+// ═══════════════════════════════════════════════════════════════════
+
+class CublasLtContext {
+public:
+    void init(size_t workspace_bytes = 32 * 1024 * 1024) {
+        CUBLAS_CHECK(cublasLtCreate(&handle_));
+        workspace_bytes_ = workspace_bytes;
+        CUDA_CHECK(cudaMalloc(&workspace_, workspace_bytes_));
+    }
+
+    void destroy() {
+        if (workspace_) { cudaFree(workspace_); workspace_ = nullptr; }
+        if (handle_)    { cublasLtDestroy(handle_); handle_ = nullptr; }
+    }
+
+    cublasLtHandle_t handle() const { return handle_; }
+    void*  workspace()        const { return workspace_; }
+    size_t workspace_bytes()  const { return workspace_bytes_; }
+
+private:
+    cublasLtHandle_t handle_       = nullptr;
+    void*            workspace_    = nullptr;
+    size_t           workspace_bytes_ = 0;
+};
+
+struct LtShapeKey {
+    int M, N, K;
+    int lda, ldb, ldc;
+    bool operator==(const LtShapeKey& o) const {
+        return M == o.M && N == o.N && K == o.K
+            && lda == o.lda && ldb == o.ldb && ldc == o.ldc;
+    }
+};
+struct LtShapeKeyHash {
+    size_t operator()(const LtShapeKey& k) const noexcept {
+        size_t h = 1469598103934665603ull;            // FNV-1a
+        auto mix = [&](size_t v){ h ^= v; h *= 1099511628211ull; };
+        mix((size_t)k.M);   mix((size_t)k.N);   mix((size_t)k.K);
+        mix((size_t)k.lda); mix((size_t)k.ldb); mix((size_t)k.ldc);
+        return h;
+    }
+};
+
+struct LtPlan {
+    cublasLtMatmulDesc_t           op_desc   = nullptr;
+    cublasLtMatrixLayout_t         A_layout  = nullptr;
+    cublasLtMatrixLayout_t         B_layout  = nullptr;
+    cublasLtMatrixLayout_t         C_layout  = nullptr;
+    cublasLtMatrixLayout_t         D_layout  = nullptr;
+    cublasLtMatmulAlgo_t           algo      {};
+    bool                           valid     = false;
+};
+
+inline void destroy_lt_plan(LtPlan& p) {
+    if (p.D_layout)  { cublasLtMatrixLayoutDestroy(p.D_layout);  p.D_layout = nullptr; }
+    if (p.C_layout)  { cublasLtMatrixLayoutDestroy(p.C_layout);  p.C_layout = nullptr; }
+    if (p.B_layout)  { cublasLtMatrixLayoutDestroy(p.B_layout);  p.B_layout = nullptr; }
+    if (p.A_layout)  { cublasLtMatrixLayoutDestroy(p.A_layout);  p.A_layout = nullptr; }
+    if (p.op_desc)   { cublasLtMatmulDescDestroy(p.op_desc);     p.op_desc  = nullptr; }
+    p.valid = false;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  FP16 launcher  (FP16 input row-major panel, FP32 output col-major)
+//  TN configuration matching the symmetric L*L^T trailing update.
+// ═══════════════════════════════════════════════════════════════════
+
+class Fp16GemmLt {
+public:
+    void set_context(CublasLtContext* ctx) { ctx_ = ctx; }
+
+    void run(int M, int N, int K,
+             const __half* A, int lda,
+             const __half* B, int ldb,
+             float* C, int ldc,
+             float alpha, float beta,
+             cudaStream_t stream)
+    {
+        LtPlan& plan = get_or_build_plan(M, N, K, lda, ldb, ldc);
+        CUBLAS_CHECK(cublasLtMatmul(
+            ctx_->handle(),
+            plan.op_desc,
+            &alpha,
+            A, plan.A_layout,
+            B, plan.B_layout,
+            &beta,
+            C, plan.C_layout,
+            C, plan.D_layout,
+            &plan.algo,
+            ctx_->workspace(),
+            ctx_->workspace_bytes(),
+            stream));
+    }
+
+    void clear_cache() {
+        for (auto& kv : cache_) destroy_lt_plan(kv.second);
+        cache_.clear();
+    }
+
+    ~Fp16GemmLt() { clear_cache(); }
+
+private:
+    LtPlan& get_or_build_plan(int M, int N, int K,
+                              int lda, int ldb, int ldc)
+    {
+        LtShapeKey key{M, N, K, lda, ldb, ldc};   // was {M, N, K}
+        auto it = cache_.find(key);
+        if (it != cache_.end() && it->second.valid) return it->second;
+
+        LtPlan plan;
+
+        CUBLAS_CHECK(cublasLtMatmulDescCreate(
+            &plan.op_desc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
+
+        cublasOperation_t opA = CUBLAS_OP_T;
+        cublasOperation_t opB = CUBLAS_OP_N;
+        CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(
+            plan.op_desc, CUBLASLT_MATMUL_DESC_TRANSA, &opA, sizeof(opA)));
+        CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(
+            plan.op_desc, CUBLASLT_MATMUL_DESC_TRANSB, &opB, sizeof(opB)));
+
+        CUBLAS_CHECK(cublasLtMatrixLayoutCreate(
+            &plan.A_layout, CUDA_R_16F, K, M, lda));
+        CUBLAS_CHECK(cublasLtMatrixLayoutCreate(
+            &plan.B_layout, CUDA_R_16F, K, N, ldb));
+        CUBLAS_CHECK(cublasLtMatrixLayoutCreate(
+            &plan.C_layout, CUDA_R_32F, M, N, ldc));
+        CUBLAS_CHECK(cublasLtMatrixLayoutCreate(
+            &plan.D_layout, CUDA_R_32F, M, N, ldc));
+
+        cublasLtMatmulPreference_t pref;
+        CUBLAS_CHECK(cublasLtMatmulPreferenceCreate(&pref));
+        size_t ws = ctx_->workspace_bytes();
+        CUBLAS_CHECK(cublasLtMatmulPreferenceSetAttribute(
+            pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+            &ws, sizeof(ws)));
+
+        cublasLtMatmulHeuristicResult_t heur{};
+        int returned = 0;
+        CUBLAS_CHECK(cublasLtMatmulAlgoGetHeuristic(
+            ctx_->handle(), plan.op_desc,
+            plan.A_layout, plan.B_layout, plan.C_layout, plan.D_layout,
+            pref, 1, &heur, &returned));
+        cublasLtMatmulPreferenceDestroy(pref);
+
+        if (returned == 0) {
+            fprintf(stderr,
+                "Fp16GemmLt: no cuBLASLt algorithm for M=%d N=%d K=%d\n",
+                M, N, K);
+            std::exit(1);
+        }
+        plan.algo  = heur.algo;
+        plan.valid = true;
+
+        auto [ins_it, _] = cache_.emplace(key, std::move(plan));
+        return ins_it->second;
+    }
+
+    CublasLtContext*                                              ctx_ = nullptr;
+    std::unordered_map<LtShapeKey, LtPlan, LtShapeKeyHash>        cache_;
+};
+
+// ═══════════════════════════════════════════════════════════════════
+//  FP8 tensorwide-scaled launcher (single FP32 scalar per matrix).
+//
+//  Why tensorwide and not VEC128 1-D block scaling?
+//    The VEC128 path requires a specific scale-array layout that
+//    is poorly documented and easy to get wrong, leading to silent
+//    NaN production.  Tensorwide scaling is the original (cuBLAS 12.0+)
+//    FP8 path documented in NVIDIA's LtFp8Matmul sample and is widely
+//    used in production code (e.g. PyTorch's torch._scaled_mm default).
+//
+//  Inputs:
+//    A_fp8 : __nv_fp8_e4m3, ROW-MAJOR M × K, ld_row = K
+//    B_fp8 : __nv_fp8_e4m3, COL-MAJOR view K × N, ld_col = K
+//            (For symmetric L*L^T, same physical buffer as A.)
+//    a_scale: device pointer to FP32 vector of length M (one scale per row of A)
+//    b_scale: device pointer to FP32 vector of length N (one scale per col of B)
+//             For symmetric L*L^T, same buffer as a_scale (since A's rows
+//             correspond to B's columns when B is the transpose view).
+//
+//  Output: __nv_bfloat16, col-major M × N, ld = ldd.
+//
+//  Uses CUBLASLT_MATMUL_MATRIX_SCALE_OUTER_VEC_32F: per-row scaling for A,
+//  per-column scaling for B.  This matches PyTorch's "rowwise" scaled_mm
+//  path which uses scale_a (M, 1) and scale_b (1, N).
+// ═══════════════════════════════════════════════════════════════════
+
+class Fp8BlockScaledGemmLt {
+public:
+    void set_context(CublasLtContext* ctx) { ctx_ = ctx; }
+
+    void run(int M, int N, int K,
+             const __nv_fp8_e4m3* A_fp8,
+             const __nv_fp8_e4m3* B_fp8,
+             const float* a_scale,
+             const float* b_scale,
+             __nv_bfloat16* D, int ldd,
+             float alpha, float beta,
+             cudaStream_t stream)
+    {
+        LtPlan& plan = get_or_build_plan(M, N, K, ldd, a_scale, b_scale);
+
+        CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(
+            plan.op_desc, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
+            &a_scale, sizeof(a_scale)));
+        CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(
+            plan.op_desc, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,
+            &b_scale, sizeof(b_scale)));
+
+        CUBLAS_CHECK(cublasLtMatmul(
+            ctx_->handle(),
+            plan.op_desc,
+            &alpha,
+            A_fp8, plan.A_layout,
+            B_fp8, plan.B_layout,
+            &beta,
+            D, plan.C_layout,
+            D, plan.D_layout,
+            &plan.algo,
+            ctx_->workspace(),
+            ctx_->workspace_bytes(),
+            stream));
+    }
+
+    void clear_cache() {
+        for (auto& kv : cache_) destroy_lt_plan(kv.second);
+        cache_.clear();
+    }
+
+    ~Fp8BlockScaledGemmLt() { clear_cache(); }
+
+private:
+    LtPlan& get_or_build_plan(int M, int N, int K, int ldd,
+                              const float* a_scale, const float* b_scale)
+    {
+        LtShapeKey key{M, N, K, K, K, ldd};       // was {M, N, K}
+        auto it = cache_.find(key);
+        if (it != cache_.end() && it->second.valid) return it->second;
+
+        LtPlan plan;
+
+        CUBLAS_CHECK(cublasLtMatmulDescCreate(
+            &plan.op_desc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
+
+        // TN configuration (Hopper FP8 requirement)
+        cublasOperation_t opA = CUBLAS_OP_T;
+        cublasOperation_t opB = CUBLAS_OP_N;
+        CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(
+            plan.op_desc, CUBLASLT_MATMUL_DESC_TRANSA, &opA, sizeof(opA)));
+        CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(
+            plan.op_desc, CUBLASLT_MATMUL_DESC_TRANSB, &opB, sizeof(opB)));
+
+        // Per-row scaling for A, per-column scaling for B.
+        // PyTorch's "rowwise" path uses this same enum.
+        // (Without explicitly setting this attribute, cuBLAS defaults to
+        //  SCALAR_32F = tensorwide.  Setting it explicitly is required
+        //  to engage the per-row mode.)
+        cublasLtMatmulMatrixScale_t scale_mode =
+            CUBLASLT_MATMUL_MATRIX_SCALE_OUTER_VEC_32F;
+        CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(
+            plan.op_desc, CUBLASLT_MATMUL_DESC_A_SCALE_MODE,
+            &scale_mode, sizeof(scale_mode)));
+        CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(
+            plan.op_desc, CUBLASLT_MATMUL_DESC_B_SCALE_MODE,
+            &scale_mode, sizeof(scale_mode)));
+
+        // Scale pointers (required even at heuristic time when FP8 is used).
+        CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(
+            plan.op_desc, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
+            &a_scale, sizeof(a_scale)));
+        CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(
+            plan.op_desc, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,
+            &b_scale, sizeof(b_scale)));
+
+        // Fast-accum is permitted with rowwise (OUTER_VEC) scaling.
+        // (PyTorch disallows fast_accum only for 128-element 1D and
+        //  128x128 2D blockwise scaling — rowwise is fine.)
+        int8_t fast_accum = 0;
+        CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(
+            plan.op_desc, CUBLASLT_MATMUL_DESC_FAST_ACCUM,
+            &fast_accum, sizeof(fast_accum)));
+
+        CUBLAS_CHECK(cublasLtMatrixLayoutCreate(
+            &plan.A_layout, CUDA_R_8F_E4M3, K, M, K));
+        CUBLAS_CHECK(cublasLtMatrixLayoutCreate(
+            &plan.B_layout, CUDA_R_8F_E4M3, K, N, K));
+        CUBLAS_CHECK(cublasLtMatrixLayoutCreate(
+            &plan.C_layout, CUDA_R_16BF, M, N, ldd));
+        CUBLAS_CHECK(cublasLtMatrixLayoutCreate(
+            &plan.D_layout, CUDA_R_16BF, M, N, ldd));
+
+        cublasLtMatmulPreference_t pref;
+        CUBLAS_CHECK(cublasLtMatmulPreferenceCreate(&pref));
+        size_t ws = ctx_->workspace_bytes();
+        CUBLAS_CHECK(cublasLtMatmulPreferenceSetAttribute(
+            pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+            &ws, sizeof(ws)));
+
+        cublasLtMatmulHeuristicResult_t heur{};
+        int returned = 0;
+        cublasStatus_t hstat = cublasLtMatmulAlgoGetHeuristic(
+            ctx_->handle(), plan.op_desc,
+            plan.A_layout, plan.B_layout, plan.C_layout, plan.D_layout,
+            pref, 1, &heur, &returned);
+        cublasLtMatmulPreferenceDestroy(pref);
+
+        if (hstat != CUBLAS_STATUS_SUCCESS) {
+            fprintf(stderr,
+                "Fp8 tensorwide GEMM: heuristic returned %d for M=%d N=%d K=%d\n",
+                (int)hstat, M, N, K);
+            std::exit(1);
+        }
+        if (returned == 0) {
+            fprintf(stderr,
+                "Fp8 tensorwide GEMM: no algorithm for M=%d N=%d K=%d\n",
+                M, N, K);
+            std::exit(1);
+        }
+        plan.algo  = heur.algo;
+        plan.valid = true;
+
+        auto [ins_it, _] = cache_.emplace(key, std::move(plan));
+        return ins_it->second;
+    }
+
+    CublasLtContext*                                              ctx_ = nullptr;
+    std::unordered_map<LtShapeKey, LtPlan, LtShapeKeyHash>        cache_;
+};
+
+// ═══════════════════════════════════════════════════════════════════
+//  Global cuBLASLt context & launchers
+// ═══════════════════════════════════════════════════════════════════
+static CublasLtContext       g_lt_ctx;
+static Fp16GemmLt            g_fp16_gemm;
+static Fp8BlockScaledGemmLt  g_fp8_gemm;
+
+// ═══════════════════════════════════════════════════════════════════
+//  FP8 row-wise quantization kernel
+//
+//  Reads FP32 col-major panel (rows × cols, ld = ld_src)
+//  Writes:
+//    dst    : FP8 row-major, ld = cols (= K)
+//    scales : FP32 vector of length `rows`.
+//             scales[m] = amax(row m of source) / 448
+//
+//  One warp per row.  Each warp does:
+//    Pass 1: lanes stride across the row to find amax, then warp-reduce.
+//    Pass 2: lane 0 writes the scale; all lanes quantize their slice.
+//
+//  This matches cuBLAS's OUTER_VEC_32F expectation: flat FP32 vector,
+//  length M for the A operand (and length N for B — for the symmetric
+//  L*L^T case the same buffer serves both since rows of A correspond
+//  to cols of B^T).
+// ═══════════════════════════════════════════════════════════════════
+
+namespace fp8bs1d {
+
+constexpr float FP8_MAX_V    = 448.0f;
+// Quantization target: rather than mapping each row's amax to FP8_MAX_V (448),
+// we map it to sqrt(FP8_MAX_V) ≈ 21.17.  This leaves ~21× headroom per operand,
+// so the products in the GEMM accumulator land near 21*21 ≈ 441 rather than
+// 448*448 ≈ 2e5 — well within FP16's range when FAST_ACCUM is on.
+// Costs ~4.4 bits of dynamic range for peak values, prevents overflow NaN.
+constexpr float FP8_TARGET   = 11.166010488516726f;  // sqrtf(448) - 10
+constexpr float AMAX_FLOOR   = 9.76562500e-04f * 16.0f;
+
+__device__ __forceinline__ float warp_reduce_max_local(float v) {
+    v = fmaxf(v, __shfl_xor_sync(0xffffffff, v, 16));
+    v = fmaxf(v, __shfl_xor_sync(0xffffffff, v,  8));
+    v = fmaxf(v, __shfl_xor_sync(0xffffffff, v,  4));
+    v = fmaxf(v, __shfl_xor_sync(0xffffffff, v,  2));
+    v = fmaxf(v, __shfl_xor_sync(0xffffffff, v,  1));
+    return v;
+}
+
+#ifdef COUNT_UNDERFLOW
+__device__ __forceinline__ int warp_reduce_sum_local(int v) {
+    v += __shfl_xor_sync(0xffffffff, v, 16);
+    v += __shfl_xor_sync(0xffffffff, v,  8);
+    v += __shfl_xor_sync(0xffffffff, v,  4);
+    v += __shfl_xor_sync(0xffffffff, v,  2);
+    v += __shfl_xor_sync(0xffffffff, v,  1);
+    return v;
+}
+#endif
+
+// One warp per row.  Grid: (ceil(rows / WARPS_PER_CTA), 1).
+template<int WARPS_PER_CTA>
+__global__ void fp32_to_fp8_rowwise_kernel(
+    __nv_fp8_e4m3* __restrict__ dst,     // row-major, ld = cols
+    float*         __restrict__ scales,  // vector of length rows
+    const float*   __restrict__ src,     // col-major, ld = ld_src
+    int rows, int cols, int ld_src
+#ifdef COUNT_UNDERFLOW
+    // Accumulator indexed by GLOBAL row of L (caller passes the array
+    // pre-offset to this call's first row); persists across calls so
+    // it tallies underflows over the whole matrix's factorization, not
+    // just this one panel.
+    , int* __restrict__ row_underflow_counts
+#endif
+    )
+{
+    const int wid  = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int row  = blockIdx.x * WARPS_PER_CTA + wid;
+    if (row >= rows) return;
+
+    // Pass 1: amax over the whole row
+    float local_max = 0.f;
+    for (int k = lane; k < cols; k += 32) {
+        float v = src[(size_t)k * ld_src + row];
+        local_max = fmaxf(local_max, fabsf(v));
+    }
+    local_max = warp_reduce_max_local(local_max);
+
+    const float scale     = (local_max > AMAX_FLOOR) ? (local_max / FP8_TARGET) : 1.f;
+    const float inv_scale = 1.f / scale;
+
+    if (lane == 0) scales[row] = scale;
+
+#ifdef COUNT_UNDERFLOW
+    int local_underflow = 0;
+#endif
+
+    // Pass 2: quantize and write row-major
+    for (int k = lane; k < cols; k += 32) {
+        float orig = src[(size_t)k * ld_src + row];
+        float v = orig * inv_scale;
+        // Clamp to FP8 representable range (±448).  In normal operation
+        // the largest value lands near ±FP8_TARGET ≈ ±21; the clamp only
+        // catches outliers from the AMAX_FLOOR branch or numerical edge cases.
+        v = fminf(fmaxf(v, -FP8_MAX_V), FP8_MAX_V);
+        __nv_fp8_e4m3 q = __nv_fp8_e4m3(v);
+#ifdef COUNT_UNDERFLOW
+        if (orig != 0.f && float(q) == 0.f) local_underflow++;
+#endif
+        dst[(size_t)row * cols + k] = q;
+    }
+
+#ifdef COUNT_UNDERFLOW
+    int row_underflow = warp_reduce_sum_local(local_underflow);
+    if (lane == 0 && row_underflow > 0)
+        atomicAdd(&row_underflow_counts[row], row_underflow);
+#endif
+}
+
+inline void launch(
+    __nv_fp8_e4m3* dst,
+    float*         scales,        // FP32 vector of length `rows`
+    const float*   src,
+    int rows, int cols, int ld_src,
+    cudaStream_t   stream
+#ifdef COUNT_UNDERFLOW
+    , int* row_underflow_counts   // device array, pre-offset to global row 0 of this call
+#endif
+    )
+{
+    constexpr int WARPS_PER_CTA = 4;
+    const int grid_x = (rows + WARPS_PER_CTA - 1) / WARPS_PER_CTA;
+    fp32_to_fp8_rowwise_kernel<WARPS_PER_CTA><<<grid_x, WARPS_PER_CTA * 32, 0, stream>>>(
+        dst, scales, src, rows, cols, ld_src
+#ifdef COUNT_UNDERFLOW
+        , row_underflow_counts
+#endif
+        );
+    CUDA_CHECK(cudaGetLastError());
+}
+
+}  // namespace fp8bs1d
+
+// ═══════════════════════════════════════════════════════════════════
+//  Lanczos extreme-eigenvalue estimation
+// ═══════════════════════════════════════════════════════════════════
+#ifdef COND_APPROX
 
 static inline void lanczos_extreme_eigs(
         const double* d_A, const double* d_L, int n, int k_max,
@@ -161,20 +642,17 @@ static inline void lanczos_extreme_eigs(
 {
     if (k_max > n) k_max = n;
 
-    // Device vectors — basis V (n × k_max), work vectors
     double *d_V, *d_w, *d_tmp;
     cudaMalloc(&d_V,  sizeof(double) * (size_t)n * k_max);
     cudaMalloc(&d_w,  sizeof(double) * n);
     cudaMalloc(&d_tmp,sizeof(double) * n);
 
-    // Host-side tridiag (α on diag, β on off-diag)
     std::vector<double> alpha(k_max, 0.0), beta(k_max, 0.0);
 
     cublasPointerMode_t old_mode;
     cublasGetPointerMode(blas, &old_mode);
     cublasSetPointerMode(blas, CUBLAS_POINTER_MODE_HOST);
 
-    // v_0 = random, then normalize
     {
         int bl = 256, gr = (n + bl - 1) / bl;
         init_lanczos_start_kernel<<<gr, bl>>>(d_V, n, 0xC0FFEEu);
@@ -189,13 +667,10 @@ static inline void lanczos_extreme_eigs(
         double* vj   = d_V + (size_t)j * n;
         double* vjp1 = (j + 1 < k_max) ? d_V + (size_t)(j + 1) * n : d_tmp;
 
-        // w = op(v_j)
         if (d_L == nullptr) {
-            // w = A * vj
             double one = 1.0, zero = 0.0;
             cublasDgemv(blas, CUBLAS_OP_N, n, n, &one, d_A, n, vj, 1, &zero, d_w, 1);
         } else {
-            // w = L⁻¹ ( A ( L⁻ᵀ vj ) )
             cudaMemcpy(d_w, vj, sizeof(double) * n, cudaMemcpyDeviceToDevice);
             cublasDtrsv(blas, CUBLAS_FILL_MODE_LOWER, CUBLAS_OP_T,
                         CUBLAS_DIAG_NON_UNIT, n, d_L, n, d_w, 1);
@@ -206,10 +681,8 @@ static inline void lanczos_extreme_eigs(
                         CUBLAS_DIAG_NON_UNIT, n, d_L, n, d_w, 1);
         }
 
-        // α_j = v_j^T w
         cublasDdot(blas, n, vj, 1, d_w, 1, &alpha[j]);
 
-        // w -= α_j v_j  (and β_{j-1} v_{j-1} if j > 0)
         double na = -alpha[j];
         cublasDaxpy(blas, n, &na, vj, 1, d_w, 1);
         if (j > 0) {
@@ -218,7 +691,6 @@ static inline void lanczos_extreme_eigs(
             cublasDaxpy(blas, n, &nb, vjm1, 1, d_w, 1);
         }
 
-        // Full reorthogonalization against v_0 … v_j
         for (int i = 0; i <= j; ++i) {
             double* vi = d_V + (size_t)i * n;
             double dot;
@@ -227,7 +699,6 @@ static inline void lanczos_extreme_eigs(
             cublasDaxpy(blas, n, &ndot, vi, 1, d_w, 1);
         }
 
-        // β_j = ||w||
         cublasDnrm2(blas, n, d_w, 1, &beta[j]);
 
         if (beta[j] < 1e-14) { k_used = j + 1; break; }
@@ -240,7 +711,6 @@ static inline void lanczos_extreme_eigs(
     }
     cublasSetPointerMode(blas, old_mode);
 
-    // Build tridiagonal as a dense k_used × k_used symmetric matrix on device
     std::vector<double> T_host((size_t)k_used * k_used, 0.0);
     for (int i = 0; i < k_used; ++i) {
         T_host[(size_t)i * k_used + i] = alpha[i];
@@ -269,7 +739,6 @@ static inline void lanczos_extreme_eigs(
     std::vector<double> evals(k_used);
     cudaMemcpy(evals.data(), d_evals, sizeof(double) * k_used, cudaMemcpyDeviceToHost);
 
-    // Eigenvalues come sorted ascending from Dsyevd
     lambda_min = evals.front();
     lambda_max = evals.back();
 
@@ -277,30 +746,28 @@ static inline void lanczos_extreme_eigs(
     cudaFree(d_V); cudaFree(d_w); cudaFree(d_tmp);
 }
 
-// =============================================================================
-//  Convenience wrapper: compute κ = λmax / λmin
-// =============================================================================
 static inline double estimate_kappa(
         const double* d_A, const double* d_L, int n, int k_max,
         cublasHandle_t blas, cusolverDnHandle_t cusolver)
 {
     double lmin, lmax;
     lanczos_extreme_eigs(d_A, d_L, n, k_max, lmin, lmax, blas, cusolver);
-    if (lmin <= 0) return -1.0;   // indicator: indefinite or numerical failure
+    if (lmin <= 0) return -1.0;
     return lmax / lmin;
 }
 
-// =============================================================================
-//  ExtraMetrics — aggregates everything for CSV emission.
-// =============================================================================
+#endif  // COND_APPROX
+
+// ═══════════════════════════════════════════════════════════════════
+//  ExtraMetrics
+// ═══════════════════════════════════════════════════════════════════
 struct ExtraMetrics {
-    double forward_err;        // ‖x - ones‖ / sqrt(n)
-    double true_resid;         // ‖b - Ax‖ / ‖b‖  (FP64)
-    double time_per_iter_ms;   // pcg_ms / iters
-    double kappa_A_est;        // Lanczos estimate of κ(A); -1 if not computed
-    double kappa_MinvA_est;    // Lanczos estimate of κ(M⁻¹A); -1 if unprec
-    int    nan_flag;           // 1 if preconditioner had NaN, else 0
-    // Adaptive-only (0 for non-adaptive)
+    double forward_err;
+    double true_resid;
+    double time_per_iter_ms;
+    double kappa_A_est;
+    double kappa_MinvA_est;
+    int    nan_flag;
     int    steps_fp8, steps_fp16, steps_tf32, steps_fp32, steps_fp64;
 };
 
@@ -311,9 +778,6 @@ static inline ExtraMetrics make_extra_metrics_default() {
     m.steps_fp8 = m.steps_fp16 = m.steps_tf32 = m.steps_fp32 = m.steps_fp64 = 0;
     return m;
 }
-
-
-
 
 // ─── Eigenvalue distribution enum ────────────────────────────────
 enum eigenvalue_dist_t {
@@ -328,9 +792,8 @@ enum eigenvalue_dist_t {
 };
 
 static const eigenvalue_dist_t ALL_DISTS[] = {
-    DIST_GEOMETRIC, DIST_ARITHMETIC,
-    DIST_HALF_HALF, DIST_RANDOM,
-    DIST_POLY_DECAY, DIST_MULTI_CLUSTER, DIST_POWER_LAW
+    DIST_GEOMETRIC, DIST_RANDOM,
+    DIST_ARITHMETIC, DIST_MULTI_CLUSTER
 };
 static const int NUM_DISTS = sizeof(ALL_DISTS) / sizeof(ALL_DISTS[0]);
 
@@ -359,58 +822,8 @@ eigenvalue_dist_t dist_from_name(const char* s) {
     exit(1);
 }
 
-
-// ─── Error macros ────────────────────────────────────────────────
-#define CUDA_CHECK(call) do {                                      \
-    cudaError_t e = (call);                                        \
-    if (e != cudaSuccess) {                                        \
-        fprintf(stderr, "CUDA %s:%d: %s\n",                       \
-                __FILE__, __LINE__, cudaGetErrorString(e));        \
-        exit(1);                                                   \
-    }                                                              \
-} while (0)
-
-#define CUSOLVER_CHECK(call) do {                                  \
-    cusolverStatus_t s = (call);                                   \
-    if (s != CUSOLVER_STATUS_SUCCESS) {                            \
-        fprintf(stderr, "cuSOLVER %s:%d: %d\n",                   \
-                __FILE__, __LINE__, (int)s); exit(1);              \
-    }                                                              \
-} while (0)
-
-#define CUBLAS_CHECK(call) do {                                    \
-    cublasStatus_t s = (call);                                     \
-    if (s != CUBLAS_STATUS_SUCCESS) {                              \
-        fprintf(stderr, "cuBLAS %s:%d: %d\n",                     \
-                __FILE__, __LINE__, (int)s); exit(1);              \
-    }                                                              \
-} while (0)
-
-#define CURAND_CHECK(call) do {                                    \
-    curandStatus_t s = (call);                                     \
-    if (s != CURAND_STATUS_SUCCESS) {                              \
-        fprintf(stderr, "cuRAND %s:%d: %d\n",                     \
-                __FILE__, __LINE__, (int)s); exit(1);              \
-    }                                                              \
-} while (0)
-
-#define CUTLASS_CHECK(status) do {                                 \
-    if ((status) != cutlass::Status::kSuccess) {                   \
-        fprintf(stderr, "CUTLASS %s:%d: %d\n",                    \
-                __FILE__, __LINE__, (int)(status)); exit(1);       \
-    }                                                              \
-} while (0)
-
-
 // ═══════════════════════════════════════════════════════════════════
-//  Precision enum for adaptive selection
-//
-//  Ordered from lowest to highest precision.  The adaptive selector
-//  picks the *lowest* precision whose error bound is satisfied.
-//
-//  TF32 sits between FP16 and FP32: it has the same 10-bit mantissa
-//  as FP16 (so eps = 2^-10 ≈ 9.77e-4) but the full FP32 exponent
-//  range, and operates directly on FP32 data (no conversion needed).
+//  Precision enum
 // ═══════════════════════════════════════════════════════════════════
 
 enum PrecisionChoice {
@@ -433,6 +846,37 @@ static const char* precision_name(PrecisionChoice p) {
     }
 }
 
+// Mantissa (stored-fraction) bits per precision tier, for the Figure-5
+// per-panel staircase.  FP8 is E4M3 (3 mantissa bits); TF32 carries a
+// 10-bit mantissa like FP16; bf16 (7) is not directly selectable here.
+static int mantissa_bits_for_prec(PrecisionChoice p) {
+    switch (p) {
+        case PREC_FP8:  return 3;
+        case PREC_FP16: return 10;
+        case PREC_TF32: return 10;
+        case PREC_FP32: return 23;
+        case PREC_FP64: return 52;
+        default:        return 52;
+    }
+}
+
+// Monotonically increasing identifier assigned to every per-run record
+// (one per (matrix, preconditioner/eps_prime) point).  The adaptive runs
+// thread their run_id into the per-panel log so the two CSVs can be joined.
+static long g_next_run_id = 0;
+
+// ─── Context for the append-only per-panel log (INSTRUMENTATION §1) ──
+struct PanelLogCtx {
+    FILE*       fp            = nullptr;
+    long        run_id        = 0;
+    const char* matrix_id     = "";
+    const char* spectrum_type = "";
+    int         n             = 0;
+    double      kappa         = 0.0;
+    int         nb            = 0;
+    double      eps_prime     = 0.0;
+    double      c_underflow   = 0.0;
+};
 
 // ═══════════════════════════════════════════════════════════════════
 //  Small utility kernels
@@ -448,13 +892,11 @@ __global__ void add_diagonal_f32_kernel(float* A, int n, float val) {
     if (i < n) A[(size_t)i * n + i] += val;
 }
 
-
 // ═══════════════════════════════════════════════════════════════════
 //  GPU panel Cholesky (spotf2) — single-block right-looking
 // ═══════════════════════════════════════════════════════════════════
 static constexpr int SPOTRF_PANEL_IB = 32;
 
-// ── Warp-shuffle helpers for double (two 32-bit shuffles) ────────────────
 __device__ __forceinline__ double shfl_down_f64(double v, int offset) {
     int lo = __shfl_down_sync(0xffffffff, __double2loint(v), offset);
     int hi = __shfl_down_sync(0xffffffff, __double2hiint(v), offset);
@@ -466,7 +908,6 @@ __device__ __forceinline__ double shfl_xor_f64(double v, int mask) {
     return __hiloint2double(hi, lo);
 }
 
-// ── Type-dispatched device math ──────────────────────────────────────────
 template<typename T> __device__ __forceinline__ T dev_sqrt(T v);
 template<> __device__ __forceinline__ float  dev_sqrt(float v)  { return sqrtf(v); }
 template<> __device__ __forceinline__ double dev_sqrt(double v) { return sqrt(v); }
@@ -487,14 +928,11 @@ template<> __device__ __forceinline__ double shfl_down_T(double v, int offset) {
     return shfl_down_f64(v, offset);
 }
 
-
-
 __device__ __forceinline__ void print_if_negative(float val, int idx) {
     int tid = threadIdx.x + blockIdx.x * blockDim.x;
     if (val < 0.0f) {
         printf("Underflow at index %d: %e, for thread %d\n", idx, val, tid);
     }
-
 }
 
 __global__ void coo_to_dense_f64_kernel(
@@ -512,19 +950,13 @@ __global__ void coo_to_dense_f64_kernel(
     if (symmetric && r != c)
         A[(size_t)r * lda + c] = val[i];
 }
- 
-// ── Load a Matrix Market file → dense FP64 matrix on GPU ─────────
-//
-// Returns 0 on success, nonzero on error.
-// Caller must cudaFree(*d_A) when done.
-// Only loads real symmetric/general matrices ≤ max_dim.
 
 __global__ void set_diagonal_f64_kernel(double* A, int lda,
                                          int start, int end, double val) {
     int i = blockIdx.x * blockDim.x + threadIdx.x + start;
     if (i < end) A[(size_t)i * lda + i] = val;
 }
- 
+
 int load_mtx_to_dense_f64(const char* path, double** d_A, int* out_n,
                            int max_dim = 40000)
 {
@@ -533,51 +965,49 @@ int load_mtx_to_dense_f64(const char* path, double** d_A, int* out_n,
         fprintf(stderr, "Cannot open %s\n", path);
         return -1;
     }
- 
+
     MM_typecode matcode;
     if (mm_read_banner(f, &matcode) != 0) {
         fprintf(stderr, "Could not read Matrix Market banner in %s\n", path);
         fclose(f);
         return -1;
     }
- 
+
     if (!mm_is_matrix(matcode) || !mm_is_coordinate(matcode) || !mm_is_real(matcode)) {
         fprintf(stderr, "Only real coordinate matrices supported (got %s)\n", path);
         fclose(f);
         return -1;
     }
- 
+
     bool symmetric = mm_is_symmetric(matcode);
-    bool is_general = mm_is_general(matcode);
- 
+
     int M, N, nnz_file;
     if (mm_read_mtx_crd_size(f, &M, &N, &nnz_file) != 0) {
         fprintf(stderr, "Could not read matrix size from %s\n", path);
         fclose(f);
         return -1;
     }
- 
+
     if (M != N) {
         fprintf(stderr, "Matrix is not square: %d x %d\n", M, N);
         fclose(f);
         return -1;
     }
- 
+
     if (M > max_dim) {
         fprintf(stderr, "Matrix too large: %d > %d max\n", M, max_dim);
         fclose(f);
         return -1;
     }
- 
+
     printf("  Loading %s: %d x %d, %d entries, %s\n",
            path, M, N, nnz_file,
            symmetric ? "symmetric" : "general");
- 
-    // Read COO triplets on host
+
     int*    h_row = (int*)malloc(sizeof(int)    * nnz_file);
     int*    h_col = (int*)malloc(sizeof(int)    * nnz_file);
     double* h_val = (double*)malloc(sizeof(double) * nnz_file);
- 
+
     for (int i = 0; i < nnz_file; i++) {
         int r, c;
         double v;
@@ -587,19 +1017,17 @@ int load_mtx_to_dense_f64(const char* path, double** d_A, int* out_n,
             fclose(f);
             return -1;
         }
-        h_row[i] = r - 1;  // 1-based → 0-based
+        h_row[i] = r - 1;
         h_col[i] = c - 1;
         h_val[i] = v;
     }
     fclose(f);
- 
+
     int n = M;
     size_t dense_bytes = sizeof(double) * (size_t)n * n;
- 
-    // Check GPU memory
+
     size_t free_mem, total_mem;
     CUDA_CHECK(cudaMemGetInfo(&free_mem, &total_mem));
-    // Need ~3x dense for A + L + workspace
     if (dense_bytes * 3 > free_mem) {
         fprintf(stderr, "Insufficient GPU memory: need ~%.1f GB, have %.1f GB free\n",
                 (double)(dense_bytes * 3) / (1024.0*1024.0*1024.0),
@@ -607,13 +1035,11 @@ int load_mtx_to_dense_f64(const char* path, double** d_A, int* out_n,
         free(h_row); free(h_col); free(h_val);
         return -1;
     }
- 
-    // Allocate dense matrix on GPU and zero it
+
     double* dA;
     CUDA_CHECK(cudaMalloc(&dA, dense_bytes));
     CUDA_CHECK(cudaMemset(dA, 0, dense_bytes));
- 
-    // Upload COO to device
+
     int*    d_row;
     int*    d_col;
     double* d_val;
@@ -623,28 +1049,26 @@ int load_mtx_to_dense_f64(const char* path, double** d_A, int* out_n,
     CUDA_CHECK(cudaMemcpy(d_row, h_row, sizeof(int)    * nnz_file, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_col, h_col, sizeof(int)    * nnz_file, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_val, h_val, sizeof(double) * nnz_file, cudaMemcpyHostToDevice));
- 
+
     free(h_row); free(h_col); free(h_val);
- 
-    // Scatter COO → dense
+
     int bl = 256, gr = (nnz_file + bl - 1) / bl;
     coo_to_dense_f64_kernel<<<gr, bl>>>(dA, d_row, d_col, d_val,
                                          nnz_file, n, n, symmetric);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
- 
+
     CUDA_CHECK(cudaFree(d_row));
     CUDA_CHECK(cudaFree(d_col));
     CUDA_CHECK(cudaFree(d_val));
- 
+
     *d_A   = dA;
     *out_n = n;
- 
+
     printf("  Dense matrix: %d x %d (%.2f GB)\n",
            n, n, (double)dense_bytes / (1024.0*1024.0*1024.0));
-    // ── Pad to next multiple of nb for CUTLASS alignment ─────────
-    //    (identity block on padded diagonal keeps SPD)
-    int pad_to = 256;  // must match --nb; or pass nb as a parameter
+
+    int pad_to = 256;
     int n_padded = ((n + pad_to - 1) / pad_to) * pad_to;
 
     if (n_padded != n) {
@@ -655,17 +1079,15 @@ int load_mtx_to_dense_f64(const char* path, double** d_A, int* out_n,
         CUDA_CHECK(cudaMalloc(&dA_padded, padded_bytes));
         CUDA_CHECK(cudaMemset(dA_padded, 0, padded_bytes));
 
-        // Copy n×n block into top-left of padded matrix (col-major)
         CUDA_CHECK(cudaMemcpy2D(
-            dA_padded,  sizeof(double) * n_padded,  // dst ptr, dst pitch
-            dA,         sizeof(double) * n,          // src ptr, src pitch
-            sizeof(double) * n, n,                   // width bytes, height
+            dA_padded,  sizeof(double) * n_padded,
+            dA,         sizeof(double) * n,
+            sizeof(double) * n, n,
             cudaMemcpyDeviceToDevice));
 
-        // Padded rows/cols get identity diagonal → stays SPD
         int n_extra = n_padded - n;
-        int bl = 256, gr = (n_extra + bl - 1) / bl;
-        set_diagonal_f64_kernel<<<gr, bl>>>(dA_padded, n_padded, n, n_padded, 1.0);
+        int bl2 = 256, gr2 = (n_extra + bl2 - 1) / bl2;
+        set_diagonal_f64_kernel<<<gr2, bl2>>>(dA_padded, n_padded, n, n_padded, 1.0);
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -673,9 +1095,12 @@ int load_mtx_to_dense_f64(const char* path, double** d_A, int* out_n,
         dA = dA_padded;
         n  = n_padded;
     }
- 
+
+    *d_A = dA;
+    *out_n = n;
     return 0;
 }
+
 template <typename T>
 __global__ void potf2_panel_kernel(
     T* __restrict__ A,
@@ -685,7 +1110,7 @@ __global__ void potf2_panel_kernel(
     T beta,
     T delta)
 {
-    constexpr int NB = SPOTRF_PANEL_IB;  // 32
+    constexpr int NB = SPOTRF_PANEL_IB;
 
     extern __shared__ char smem_raw[];
     T* sA          = reinterpret_cast<T*>(smem_raw);
@@ -698,7 +1123,6 @@ __global__ void potf2_panel_kernel(
 
     if (tid == 0) *info = 0;
 
-    // ── 1. Zero tile, load real panel, pad diagonal ──────────────────────
     for (int idx = tid; idx < NB * NB; idx += blockDim.x)
         sA[idx] = T(0);
     __syncthreads();
@@ -716,7 +1140,6 @@ __global__ void potf2_panel_kernel(
 
     const T b2inv = T(1) / (beta * beta);
 
-    // ── 2. Factorize the full 32×32 tile ─────────────────────────────────
     #pragma unroll
     for (int j = 0; j < NB; j++) {
 
@@ -742,9 +1165,6 @@ __global__ void potf2_panel_kernel(
 
         if (ajj <= T(0)) {
             if (tid == 0) {
-                // Row-∞-norm of the already-computed row-j entries in L
-                // (columns 0..j-1 of row j).  Bounds the off-diagonal growth
-                // the next trailing update must be dominated by.
                 T rinf = T(0);
                 for (int k = 0; k < j; k++) {
                     T v = dev_fabs<T>(sA[k * NB + j]);
@@ -779,7 +1199,6 @@ __global__ void potf2_panel_kernel(
         __syncthreads();
     }
 
-    // ── 3. Write back lower triangle ─────────────────────────────────────
     for (int idx = tid; idx < n_actual * n_actual; idx += blockDim.x) {
         int col = idx / n_actual;
         int row = idx % n_actual;
@@ -788,25 +1207,25 @@ __global__ void potf2_panel_kernel(
         }
     }
 }
+
 template <typename T>
 void potf2_panel(T* d_A, int n, int lda, T beta, T delta,
                  int* d_info, cudaStream_t stream = 0) {
     if (n <= 0) return;
-    constexpr int NB = SPOTRF_PANEL_IB;  // 32
+    constexpr int NB = SPOTRF_PANEL_IB;
     int nwarps = 1;
-    size_t smem = (NB * NB + nwarps + NB) * sizeof(T);  // always 32×32
+    size_t smem = (NB * NB + nwarps + NB) * sizeof(T);
     potf2_panel_kernel<T><<<1, 32, smem, stream>>>(d_A, n, lda, d_info, beta, delta);
     CUDA_CHECK(cudaGetLastError());
 }
-// Keep the old name as an alias for float (used by non-adaptive code)
+
 inline void spotf2_panel(float* d_A, int n, int lda, float beta, float delta,
                          int* d_info, cudaStream_t stream = 0) {
     potf2_panel<float>(d_A, n, lda, beta, delta, d_info, stream);
 }
 
-
 // ═══════════════════════════════════════════════════════════════════
-//  Diagonal perturbation kernel for mixed-precision Cholesky
+//  Diagonal perturbation kernels
 // ═══════════════════════════════════════════════════════════════════
 
 __global__ void perturb_trailing_diagonal_kernel(
@@ -847,7 +1266,6 @@ void perturb_trailing_diagonal(float* C11, const float* L10,
     CUDA_CHECK(cudaGetLastError());
 }
 
-// Double-precision version of perturb_trailing_diagonal
 __global__ void perturb_trailing_diagonal_f64_kernel(
     double* __restrict__ C11,
     const double* __restrict__ L10,
@@ -884,7 +1302,6 @@ void perturb_trailing_diagonal_f64(double* C11, const double* L10,
         C11, L10, M, K, ldc, beta, delta);
     CUDA_CHECK(cudaGetLastError());
 }
-
 
 template <typename T>
 void potrf_panel(T* d_A, int n, int lda,
@@ -969,13 +1386,16 @@ void potrf_panel(T* d_A, int n, int lda,
     }
 }
 
-// Keep the old name as an alias for float (used by non-adaptive code)
 inline void spotrf_panel(float* d_A, int n, int lda,
                          float beta, float delta,
                          cublasHandle_t blas_handle, int* d_info,
                          cudaStream_t stream = 0) {
     potrf_panel<float>(d_A, n, lda, beta, delta, blas_handle, d_info, stream);
 }
+
+// ═══════════════════════════════════════════════════════════════════
+//  Cast / zero kernels
+// ═══════════════════════════════════════════════════════════════════
 
 __global__ void zero_upper_f32_kernel(float* A, int n) {
     size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -1023,10 +1443,48 @@ void cast_f64_to_f32(float* dst, const double* src, size_t count) {
     CUDA_CHECK(cudaGetLastError());
 }
 
-// Accumulate a float GEMM result into a double trailing matrix:
-//   dst[i] += alpha_d * src[i]
-// Used when the GEMM is done in low precision (output float) but the
-// trailing matrix lives in double.
+__global__ void accumulate_bf16_into_f32_matrix_kernel(
+    float* __restrict__ dst,
+    const __nv_bfloat16* __restrict__ src,
+    int mr, int ld_dst, int ld_src,
+    float alpha) {
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (size_t)mr * mr) return;
+    int col = (int)(idx / mr);
+    int row = (int)(idx % mr);
+    dst[(size_t)col * ld_dst + row] += alpha * __bfloat162float(src[(size_t)col * ld_src + row]);
+}
+
+void accumulate_bf16_into_f32_matrix(float* dst, const __nv_bfloat16* src,
+                                      int mr, int ld_dst, int ld_src,
+                                      float alpha, cudaStream_t stream = 0) {
+    size_t tot = (size_t)mr * mr;
+    accumulate_bf16_into_f32_matrix_kernel<<<(unsigned)((tot + 255) / 256), 256, 0, stream>>>(
+        dst, src, mr, ld_dst, ld_src, alpha);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+__global__ void accumulate_bf16_into_f64_matrix_kernel(
+    double* __restrict__ dst,
+    const __nv_bfloat16* __restrict__ src,
+    int mr, int ld_dst, int ld_src,
+    double alpha) {
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (size_t)mr * mr) return;
+    int col = (int)(idx / mr);
+    int row = (int)(idx % mr);
+    dst[(size_t)col * ld_dst + row] += alpha * (double)__bfloat162float(src[(size_t)col * ld_src + row]);
+}
+
+void accumulate_bf16_into_f64_matrix(double* dst, const __nv_bfloat16* src,
+                                      int mr, int ld_dst, int ld_src,
+                                      double alpha, cudaStream_t stream = 0) {
+    size_t tot = (size_t)mr * mr;
+    accumulate_bf16_into_f64_matrix_kernel<<<(unsigned)((tot + 255) / 256), 256, 0, stream>>>(
+        dst, src, mr, ld_dst, ld_src, alpha);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 __global__ void accumulate_f32_into_f64_kernel(
     double* __restrict__ dst,
     const float* __restrict__ src,
@@ -1036,8 +1494,6 @@ __global__ void accumulate_f32_into_f64_kernel(
     if (i < count) dst[i] += alpha * (double)src[i];
 }
 
-// dst_col_major[col*ldd + row] += alpha * src_col_major[col*lds + row]
-// for the lower-triangular mr x mr block
 __global__ void accumulate_f32_into_f64_matrix_kernel(
     double* __restrict__ dst,
     const float* __restrict__ src,
@@ -1059,7 +1515,6 @@ void accumulate_f32_into_f64_matrix(double* dst, const float* src,
     CUDA_CHECK(cudaGetLastError());
 }
 
-// Cast a submatrix from double (col-major, ld=ld_src) to float (col-major, ld=ld_dst)
 __global__ void cast_f64_to_f32_matrix_kernel(
     float* __restrict__ dst,
     const double* __restrict__ src,
@@ -1081,19 +1536,13 @@ void cast_f64_to_f32_matrix(float* dst, const double* src,
     CUDA_CHECK(cudaGetLastError());
 }
 
-
 // ═══════════════════════════════════════════════════════════════════
 //  Machine epsilon and smallest subnormal for each precision
-//
-//  TF32 (TensorFloat-32) is not a storage format — data stays FP32
-//  but tensor cores truncate the mantissa to 10 bits during multiply.
-//  Hence:  eps_TF32 = 2^-10 ≈ 9.77e-4  (same mantissa bits as FP16)
-//          subnormal_TF32 = FP32's subnormal (same exponent range)
 // ═══════════════════════════════════════════════════════════════════
 
 template <typename T>
 static __forceinline__ __device__ __host__ float get_epsilon() {
-    if constexpr (std::is_same_v<double, T>)           return 1.11022302e-16f;  // 2^-52 (actually double, stored as float approx)
+    if constexpr (std::is_same_v<double, T>)           return 1.11022302e-16f;
     if constexpr (std::is_same_v<float, T>)            return 1.19209290e-07f;
     if constexpr (std::is_same_v<__half, T>)           return 9.76562500e-04f;
     if constexpr (std::is_same_v<__nv_fp8_e4m3, T>)   return 0.125f;
@@ -1102,27 +1551,18 @@ static __forceinline__ __device__ __host__ float get_epsilon() {
 
 template <typename T>
 static __forceinline__ __device__ __host__ float get_smallest_subnormal() {
-    if constexpr (std::is_same_v<double, T>)           return 0.0f; // underflows to 0 in float — see note below
+    if constexpr (std::is_same_v<double, T>)           return 0.0f;
     if constexpr (std::is_same_v<float, T>)            return 1.40129846e-45f;
     if constexpr (std::is_same_v<__half, T>)           return 5.96046448e-08f;
     if constexpr (std::is_same_v<__nv_fp8_e4m3, T>)   return 1.95312500e-03f;
     return 1.40129846e-45f;
 }
 
-// NOTE: The double subnormal min (5e-324) is far below FP32 range, so the
-// threshold computation c * subnormal^2 will be 0 in float arithmetic.
-// This means the FP64 threshold effectively equals just eps_fp64, which
-// is the correct behaviour: FP64 has enormous exponent range so underflow
-// is never the limiting factor — only rounding matters.
-
-// TF32 epsilon: 10-bit mantissa → 2^-10
 static constexpr float TF32_EPSILON        = 9.76562500e-04f;
-// TF32 uses FP32 storage, so subnormal range matches FP32
 static constexpr float TF32_SUBNORMAL_MIN  = 1.40129846e-45f;
 
-// FP64 epsilon as a double for host-side use
-static constexpr double FP64_EPSILON       = 1.1102230246251565e-16;  // 2^-52
-static constexpr double FP64_SUBNORMAL_MIN = 4.9406564584124654e-324; // 2^-1074
+static constexpr double FP64_EPSILON       = 1.1102230246251565e-16;
+static constexpr double FP64_SUBNORMAL_MIN = 4.9406564584124654e-324;
 
 static __host__ float get_epsilon_for_prec(PrecisionChoice p) {
     switch (p) {
@@ -1130,7 +1570,7 @@ static __host__ float get_epsilon_for_prec(PrecisionChoice p) {
         case PREC_FP16: return get_epsilon<__half>();
         case PREC_TF32: return TF32_EPSILON;
         case PREC_FP32: return get_epsilon<float>();
-        case PREC_FP64: return (float)FP64_EPSILON;  // ~1.11e-16, representable in float
+        case PREC_FP64: return (float)FP64_EPSILON;
         default:        return get_epsilon<float>();
     }
 }
@@ -1141,7 +1581,7 @@ static __host__ float get_smallest_subnormal_for_prec(PrecisionChoice p) {
         case PREC_FP16: return get_smallest_subnormal<__half>();
         case PREC_TF32: return TF32_SUBNORMAL_MIN;
         case PREC_FP32: return get_smallest_subnormal<float>();
-        case PREC_FP64: return 0.0f;  // 5e-324 underflows to 0 in float — intentional
+        case PREC_FP64: return 0.0f;
         default:        return get_smallest_subnormal<float>();
     }
 }
@@ -1155,38 +1595,26 @@ static __forceinline__ __device__ __host__ float get_beta_for_precision() {
     return 1.0f;
 }
 
-
 // ═══════════════════════════════════════════════════════════════════
-//  Adaptive precision selection kernel  (boolean AND reduction)
-//
-//  Now tracks 5 precision levels with a 5-bit mask:
-//    bit 0 (0x01) = FP8,   bit 1 (0x02) = FP16,
-//    bit 2 (0x04) = TF32,  bit 3 (0x08) = FP32,
-//    bit 4 (0x10) = FP64
+//  Adaptive precision selection
 // ═══════════════════════════════════════════════════════════════════
-
 __global__ void update_diag_and_check_kernel(
     double* __restrict__ updated_diag,
     const double* __restrict__ orig_diag,
+    double* __restrict__ spent,            // NEW: committed backward error per trailing row
     const double* __restrict__ L10,
-    int trailing_start,
-    int M,
-    int K,
-    int ldc,
-    float threshold_fp8,
-    float threshold_fp16,
-    float threshold_tf32,
-    float threshold_fp32,
-    float threshold_fp64,
-    float eps_prime,
-    unsigned int* __restrict__ block_masks) {
-
+    int trailing_start, int M, int K, int ldc,
+    const float* __restrict__ g_coeff,     // NEW: [NFMT], g_P = 2*eps_P
+    const float* __restrict__ omega,       // NEW: [NFMT], omega_P = c*eps_P^2*sub_P^2
+    float eps_prime,                       // requested bound f_req
+    float chol_reserve,                    // NEW: b*eps_h  (FP64 Cholesky reserve coeff)
+    float prev_g_coeff,                    // NEW: 2*eps_{P_prev} for the panel just applied (0 on first step / if prev was FP64-exact)
+    unsigned int* __restrict__ block_masks)
+{
     extern __shared__ unsigned int smask[];
-
     int tid = threadIdx.x;
     int gid = blockIdx.x * blockDim.x + threadIdx.x;
-
-    unsigned int local_mask = 0x1Fu;  // all 5 bits set
+    unsigned int local_mask = 0x1Fu;
 
     if (gid < M) {
         int diag_idx = trailing_start + gid;
@@ -1199,23 +1627,25 @@ __global__ void update_diag_and_check_kernel(
         double new_diag = updated_diag[diag_idx] - sum_sq;
         updated_diag[diag_idx] = new_diag;
 
-        double rhs = (double)eps_prime * orig_diag[diag_idx];
+        // (3) accumulate committed error from the panel just applied (relative truncation)
+        if (prev_g_coeff > 0.0f)
+            spent[diag_idx] += (double)prev_g_coeff * sum_sq;
 
-        if (!((double)threshold_fp8  * new_diag < rhs)) local_mask &= ~0x01u;
-        if (!((double)threshold_fp16 * new_diag < rhs)) local_mask &= ~0x02u;
-        if (!((double)threshold_tf32 * new_diag < rhs)) local_mask &= ~0x04u;
-        if (!((double)threshold_fp32 * new_diag < rhs)) local_mask &= ~0x08u;
-        if (!((double)threshold_fp64 * new_diag < rhs)) local_mask &= ~0x10u;
+        double a_tt = orig_diag[diag_idx];
+        // (2) budget net of Cholesky reserve and (3) already-committed error
+        double rhs = ((double)eps_prime - (double)chol_reserve) * a_tt - spent[diag_idx];
+
+        // (1) per-format: g_P*aᵘ + omega_P < rhs   (additive underflow, factor-2 in g_P)
+        if (!((double)g_coeff[0]*new_diag + (double)omega[0] < rhs)) local_mask &= ~0x01u;
+        if (!((double)g_coeff[1]*new_diag + (double)omega[1] < rhs)) local_mask &= ~0x02u;
+        if (!((double)g_coeff[2]*new_diag + (double)omega[2] < rhs)) local_mask &= ~0x04u;
+        if (!((double)g_coeff[3]*new_diag + (double)omega[3] < rhs)) local_mask &= ~0x08u;
+        if (!((double)g_coeff[4]*new_diag + (double)omega[4] < rhs)) local_mask &= ~0x10u;
     }
 
     smask[tid] = local_mask;
     __syncthreads();
-
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) smask[tid] &= smask[tid + s];
-        __syncthreads();
-    }
-
+    for (int s = blockDim.x/2; s > 0; s >>= 1) { if (tid < s) smask[tid] &= smask[tid+s]; __syncthreads(); }
     if (tid == 0) block_masks[blockIdx.x] = smask[0];
 }
 
@@ -1227,7 +1657,7 @@ __global__ void reduce_and_kernel(
     extern __shared__ unsigned int smask[];
     int tid = threadIdx.x;
 
-    unsigned int local_mask = 0x1Fu;  // all 5 bits set
+    unsigned int local_mask = 0x1Fu;
     for (int i = tid; i < num_blocks; i += blockDim.x) {
         local_mask &= block_masks[i];
     }
@@ -1273,6 +1703,7 @@ void extract_diagonal(float* d_diag, const float* d_A, int n, int lda,
 PrecisionChoice select_precision_for_step_f64(
     double* d_updated_diag,
     const double* d_orig_diag,
+    double* d_spent,                 // NEW: length-n device array, zeroed once before the factorization
     const double* d_L10,
     int trailing_start,
     int M,
@@ -1280,40 +1711,50 @@ PrecisionChoice select_precision_for_step_f64(
     int ldc,
     float c,
     float eps_prime,
+    float chol_reserve,              // NEW: b * eps_h
+    PrecisionChoice prev_prec,       // NEW: precision of the panel GEMM just applied (PREC_FP64 => exact, no committed error)
     bool use_mx,
+    float* d_g_coeff,                // NEW: device [NFMT], persistent scratch
+    float* d_omega,                  // NEW: device [NFMT], persistent scratch
     unsigned int* d_block_masks,
     unsigned int* d_result_mask,
-    cudaStream_t stream = 0) {
-
+    cudaStream_t stream = 0)
+{
     if (M <= 0) return PREC_FP64;
 
-    float threshold_fp8  = get_epsilon_for_prec(PREC_FP8)
-                         * (1.0f + c * get_smallest_subnormal_for_prec(PREC_FP8)
-                                     * get_smallest_subnormal_for_prec(PREC_FP8));
-    float threshold_fp16 = get_epsilon_for_prec(PREC_FP16)
-                         * (1.0f + c * get_smallest_subnormal_for_prec(PREC_FP16)
-                                     * get_smallest_subnormal_for_prec(PREC_FP16));
-    float threshold_tf32 = get_epsilon_for_prec(PREC_TF32)
-                         * (1.0f + c * get_smallest_subnormal_for_prec(PREC_TF32)
-                                     * get_smallest_subnormal_for_prec(PREC_TF32));
-    float threshold_fp32 = get_epsilon_for_prec(PREC_FP32)
-                         * (1.0f + c * get_smallest_subnormal_for_prec(PREC_FP32)
-                                     * get_smallest_subnormal_for_prec(PREC_FP32));
-    float threshold_fp64 = get_epsilon_for_prec(PREC_FP64)
-                         * (1.0f + c * get_smallest_subnormal_for_prec(PREC_FP64)
-                                     * get_smallest_subnormal_for_prec(PREC_FP64));
-    // Note: threshold_fp64 ≈ eps_fp64 since subnormal_fp64^2 = 0 in float
+    // ---- build per-format coefficients on host, then upload ----
+    // g_P = 2 * eps_P   (SYRK factor of 2; drop the 2.0f if get_epsilon_for_prec already bakes it in)
+    // omega_P = c * eps_P^2 * sub_P^2   (additive underflow floor; negligible, but correct)
+    const PrecisionChoice fmts[5] =
+        { PREC_FP8, PREC_FP16, PREC_TF32, PREC_FP32, PREC_FP64 };
+
+    float h_g[5], h_omega[5];
+    for (int p = 0; p < 5; ++p) {
+        float eps = get_epsilon_for_prec(fmts[p]);
+        float sub = get_smallest_subnormal_for_prec(fmts[p]);
+        h_g[p]     = 2.0f * eps;
+        h_omega[p] = c * eps * eps * sub * sub;
+    }
+    CUDA_CHECK(cudaMemcpyAsync(d_g_coeff, h_g, 5 * sizeof(float),
+                               cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_omega, h_omega, 5 * sizeof(float),
+                               cudaMemcpyHostToDevice, stream));
+
+    // committed-error coefficient for the panel just applied
+    float prev_g = (prev_prec == PREC_FP64)
+                       ? 0.0f                                 // FP64 GEMM: ~exact, nothing committed
+                       : 2.0f * get_epsilon_for_prec(prev_prec);
 
     int block_size = 256;
     int num_blocks = (M + block_size - 1) / block_size;
 
     update_diag_and_check_kernel<<<num_blocks, block_size,
                                    block_size * sizeof(unsigned int), stream>>>(
-        d_updated_diag, d_orig_diag, d_L10,
+        d_updated_diag, d_orig_diag, d_spent, d_L10,
         trailing_start, M, K, ldc,
-        threshold_fp8, threshold_fp16, threshold_tf32, threshold_fp32,
-        threshold_fp64,
-        eps_prime, d_block_masks);
+        d_g_coeff, d_omega,
+        eps_prime, chol_reserve, prev_g,
+        d_block_masks);
     CUDA_CHECK(cudaGetLastError());
 
     int reduce_threads = std::min(num_blocks, 256);
@@ -1325,10 +1766,9 @@ PrecisionChoice select_precision_for_step_f64(
 
     unsigned int mask = 0;
     CUDA_CHECK(cudaMemcpyAsync(&mask, d_result_mask, sizeof(unsigned int),
-                                cudaMemcpyDeviceToHost, stream));
+                               cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    // Pick lowest-precision level whose bit is still set
     if (mask & 0x01u) return PREC_FP8;
     if (mask & 0x02u) return PREC_FP16;
     if (mask & 0x04u) return PREC_TF32;
@@ -1336,7 +1776,6 @@ PrecisionChoice select_precision_for_step_f64(
     return PREC_FP64;
 }
 
-// Keep the FP32-max version for the non-adaptive paths
 PrecisionChoice select_precision_for_step(
     float* d_updated_diag,
     const float* d_orig_diag,
@@ -1353,52 +1792,24 @@ PrecisionChoice select_precision_for_step(
     cudaStream_t stream = 0) {
 
     if (M <= 0) return PREC_FP32;
-
-    float threshold_fp8  = get_epsilon_for_prec(PREC_FP8)
-                         * (1.0f + c * get_smallest_subnormal_for_prec(PREC_FP8)
-                                     * get_smallest_subnormal_for_prec(PREC_FP8));
-    float threshold_fp16 = get_epsilon_for_prec(PREC_FP16)
-                         * (1.0f + c * get_smallest_subnormal_for_prec(PREC_FP16)
-                                     * get_smallest_subnormal_for_prec(PREC_FP16));
-    float threshold_tf32 = get_epsilon_for_prec(PREC_TF32)
-                         * (1.0f + c * get_smallest_subnormal_for_prec(PREC_TF32)
-                                     * get_smallest_subnormal_for_prec(PREC_TF32));
-    float threshold_fp32 = get_epsilon_for_prec(PREC_FP32)
-                         * (1.0f + c * get_smallest_subnormal_for_prec(PREC_FP32)
-                                     * get_smallest_subnormal_for_prec(PREC_FP32));
-
-    int block_size = 256;
-    int num_blocks = (M + block_size - 1) / block_size;
-
-    // Reuse the 5-threshold kernel with fp64 threshold = 0 (bit always cleared)
-    // Actually, we need the old 4-threshold kernel or a wrapper.
-    // For simplicity, just use the same kernel with a dummy fp64 threshold:
-    float threshold_fp64_dummy = 0.0f;  // will never pass → bit 4 always cleared
-
-    // But the kernel expects double* now for the f64 version...
-    // This function still works with float* — keep the old kernel signature.
-    // We'll just not use it for the adaptive-f64 path.
-
-    // For now, fall back to a simple implementation:
-    // (The old kernel expected float* diag — this is only used by non-adaptive code)
-    return PREC_FP32;  // placeholder — this path unused for adaptive-f64
+    return PREC_FP32;  // placeholder — adaptive-f32 path unused now
 }
 
-
 // ═══════════════════════════════════════════════════════════════════
-//  Ill-conditioned SPD matrix generation (FP64)
+//  Ill-conditioned SPD matrix generation
 // ═══════════════════════════════════════════════════════════════════
 
 void generate_spd(double* d_A, int n, int lda, double cond, eigenvalue_dist_t dist,
                   cublasHandle_t cb, cusolverDnHandle_t cs, cudaStream_t stream,
-                  double shape_p = 2.0, int num_clusters = 4) {
+                  double shape_p = 2.0, int num_clusters = 4,
+                  unsigned long long seed = 42ULL) {
     size_t nn = (size_t)n * n;
     double* d_B;
     CUDA_CHECK(cudaMalloc(&d_B, sizeof(double) * nn));
 
     curandGenerator_t gen;
     CURAND_CHECK(curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_DEFAULT));
-    CURAND_CHECK(curandSetPseudoRandomGeneratorSeed(gen, 42ULL));
+    CURAND_CHECK(curandSetPseudoRandomGeneratorSeed(gen, seed));
     CURAND_CHECK(curandSetStream(gen, stream));
     CURAND_CHECK(curandGenerateNormalDouble(gen, d_B, nn, 0.0, 1.0));
     CURAND_CHECK(curandDestroyGenerator(gen));
@@ -1436,7 +1847,7 @@ void generate_spd(double* d_A, int n, int lda, double cond, eigenvalue_dist_t di
                     eigs[k] = (k < n / 2) ? 1.0 : ic;
                 break;
             case DIST_RANDOM:
-                srand(123);
+                srand((unsigned)seed);
                 eigs[0] = 1.0;
                 for (int k = 1; k < n - 1; k++)
                     eigs[k] = ic + ((double)rand() / RAND_MAX) * (1.0 - ic);
@@ -1486,35 +1897,27 @@ void generate_spd(double* d_A, int n, int lda, double cond, eigenvalue_dist_t di
     CUDA_CHECK(cudaFree(d_B));
 }
 
-
 // ═══════════════════════════════════════════════════════════════════
-//  Conversion kernels — FP32 column-major → low-precision column-major
-//
-//  All storage is column-major throughout.  The panel L10 lives in the
-//  lower-left of the full column-major matrix (ld = lda = n).  We
-//  convert it into a packed column-major buffer with ld_dst = rows.
+//  Quantization kernels — FP32 → low precision
 // ═══════════════════════════════════════════════════════════════════
-
 
 #define FP8_E4M3_MAX 448.0f
 
 __global__ void fp32_to_fp8_tiled_kernel(
     __nv_fp8_e4m3* __restrict__ dst,
     const float*   __restrict__ src,
-    float*         __restrict__ scales,   // [grid.x][grid.y] output
+    float*         __restrict__ scales,
     int rows, int cols,
     int ld_src, int ld_dst)
 {
-    // ── shared memory ────────────────────────────────────────────────────
-    __shared__ float tile[QUANT_TILE][QUANT_TILE + 1];  // +1: avoid bank conflicts
-    __shared__ float smem_max[QUANT_TILE];               // one slot per row of threads
+    __shared__ float tile[QUANT_TILE][QUANT_TILE + 1];
+    __shared__ float smem_max[QUANT_TILE];
 
     int row_base = blockIdx.x * QUANT_TILE;
     int col_base = blockIdx.y * QUANT_TILE;
-    int tr = threadIdx.x;   // row within tile
-    int tc = threadIdx.y;   // col within tile
+    int tr = threadIdx.x;
+    int tc = threadIdx.y;
 
-    // ── 1. Coalesced load (col-major src → transposed shared mem) ────────
     int src_row = row_base + tr;
     int src_col = col_base + tc;
 
@@ -1522,7 +1925,7 @@ __global__ void fp32_to_fp8_tiled_kernel(
     if (src_row < rows && src_col < cols)
         v = src[(size_t)src_col * ld_src + src_row];
 
-    tile[tc][tr] = v;   // transpose: tile[col][row] so later reads are coalesced
+    tile[tc][tr] = v;
     __syncthreads();
 
     float local_abs = fabsf(tile[tr][tc]);
@@ -1531,12 +1934,10 @@ __global__ void fp32_to_fp8_tiled_kernel(
     for (int offset = QUANT_TILE / 2; offset > 0; offset >>= 1)
         local_abs = fmaxf(local_abs, __shfl_xor_sync(0xffffffff, local_abs, offset));
 
-    // Thread tc==0 writes the per-row max
     if (tc == 0)
         smem_max[tr] = local_abs;
     __syncthreads();
 
-    // Stage B: a single warp (tr < 32, tc == 0) reduces smem_max[]
     float tile_max = 0.0f;
     if (tc == 0) {
         tile_max = smem_max[tr];
@@ -1544,17 +1945,16 @@ __global__ void fp32_to_fp8_tiled_kernel(
         for (int offset = QUANT_TILE / 2; offset > 0; offset >>= 1)
             tile_max = fmaxf(tile_max, __shfl_xor_sync(0xffffffff, tile_max, offset));
 
-        // tr==0, tc==0 writes the scale
         if (tr == 0) {
             float scale = (tile_max > 9.76562500e-04f*16.0f) ? tile_max / FP8_E4M3_MAX : 1.0f;
             int scale_cols = (cols + QUANT_TILE - 1) / QUANT_TILE;
             scales[blockIdx.x * scale_cols + blockIdx.y] = scale;
-            smem_max[0] = scale;   // broadcast scale for the write stage
+            smem_max[0] = scale;
         }
     }
     __syncthreads();
 
-    float scale = smem_max[0];          // every thread reads the final scale
+    float scale = smem_max[0];
     float inv_scale = 1.0f / scale;
 
     int dst_row = row_base + tr;
@@ -1569,7 +1969,8 @@ __global__ void fp32_to_fp8_tiled_kernel(
     if (row_base == 0 && col_base == 0 && tr == 0 && tc == 0)
         scales[0] = -scales[0];
 }
- __global__ void fp32_to_fp16_tiled_kernel(
+
+__global__ void fp32_to_fp16_tiled_kernel(
     __half* __restrict__      dst,
     const float* __restrict__ src,
     int rows, int cols,
@@ -1590,16 +1991,21 @@ __global__ void fp32_to_fp8_tiled_kernel(
     tile[tc][tr] = v;
     __syncthreads();
 
+    // Output coords are swapped: tile[tr][tc] is the value this thread
+    // SHOULD write — it was loaded by the partner thread that read from
+    // (row_base+tc, col_base+tr) in column-major source space.
     int dst_row = row_base + tc;
     int dst_col = col_base + tr;
 
-    if (dst_row < rows && dst_col < cols)
-        dst[(size_t)dst_row * ld_dst + dst_col] = (__float2half(fminf(fmaxf(v, -65504.f), 65504.f)));
+    if (dst_row < rows && dst_col < cols) {
+        float w = tile[tr][tc];
+        dst[(size_t)dst_row * ld_dst + dst_col] =
+            __float2half(fminf(fmaxf(w, -65504.f), 65504.f));
+    }
 }
- 
-// Drop-in replacements for launch_convert
+
 template <typename T>
-void launch_convert(T* dst, const float* src, float* d_scales, 
+void launch_convert(T* dst, const float* src, float* d_scales,
                           int rows, int cols, int ld_src, int ld_dst,
                           cudaStream_t stream = 0) {
     dim3 grid((rows + QUANT_TILE - 1) / QUANT_TILE,
@@ -1614,438 +2020,12 @@ void launch_convert(T* dst, const float* src, float* d_scales,
             dst, src, rows, cols, ld_src, ld_dst);
         CUDA_CHECK(cudaGetLastError());
 }
- 
-
 
 // ═══════════════════════════════════════════════════════════════════
-//  CUTLASS GEMM type definitions
+//  hasNaN check on a square matrix
 // ═══════════════════════════════════════════════════════════════════
-
-using CholClusterShape = Shape<_1, _1, _1>;
-
-// --- FP8 (tensorwise, no per-block scaling) ---
-using Fp8TileShape = Shape<_128, _128, _128>;
-
-using Fp8CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
-    cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp,
-    Fp8TileShape, CholClusterShape,
-    cutlass::epilogue::collective::EpilogueTileAuto,
-    float, float,
-    float, cutlass::layout::ColumnMajor, 4,
-    float, cutlass::layout::ColumnMajor, 4,
-    cutlass::epilogue::TmaWarpSpecializedCooperative
->::CollectiveOp;
-
-using Fp8CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
-    cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp,
-    cutlass::float_e4m3_t, cutlass::layout::RowMajor, 16,
-    cutlass::float_e4m3_t, cutlass::layout::ColumnMajor, 16,
-    float, Fp8TileShape, CholClusterShape,
-    cutlass::gemm::collective::StageCountAutoCarveout<
-        static_cast<int>(sizeof(typename Fp8CollectiveEpilogue::SharedStorage))>,
-    cutlass::gemm::KernelTmaWarpSpecializedCooperativeFP8FastAccum
->::CollectiveOp;
-
-using Fp8GemmKernel = cutlass::gemm::kernel::GemmUniversal<
-    Shape<int,int,int,int>, Fp8CollectiveMainloop, Fp8CollectiveEpilogue>;
-using Fp8CutlassGemm = cutlass::gemm::device::GemmUniversalAdapter<Fp8GemmKernel>;
-
-// --- FP16 ---
-using Fp16TileShape = Shape<_128, _128, _64>;
-
-using Fp16CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
-    cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp,
-    Fp16TileShape, CholClusterShape,
-    cutlass::epilogue::collective::EpilogueTileAuto,
-    float, float,
-    float, cutlass::layout::ColumnMajor, 4,
-    float, cutlass::layout::ColumnMajor, 4,
-    cutlass::epilogue::TmaWarpSpecializedCooperative
->::CollectiveOp;
-
-using Fp16CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
-    cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp,
-    cutlass::half_t, cutlass::layout::RowMajor, 8,
-    cutlass::half_t, cutlass::layout::ColumnMajor, 8,
-    float, Fp16TileShape, CholClusterShape,
-    cutlass::gemm::collective::StageCountAutoCarveout<
-        static_cast<int>(sizeof(typename Fp16CollectiveEpilogue::SharedStorage))>,
-    cutlass::gemm::KernelTmaWarpSpecializedCooperative
->::CollectiveOp;
-
-using Fp16GemmKernel = cutlass::gemm::kernel::GemmUniversal<
-    Shape<int,int,int,int>, Fp16CollectiveMainloop, Fp16CollectiveEpilogue>;
-using Fp16CutlassGemm = cutlass::gemm::device::GemmUniversalAdapter<Fp16GemmKernel>;
-
-// --- Groupwise-scaled FP8 ---
-using GsFp8TileShape = Shape<_128, _128, _128>;
-
-constexpr int GsScaleGranularityM = 128;
-constexpr int GsScaleGranularityN = 128;
-constexpr int GsScaleGranularityK = 128;
-
-using GsScaleConfig  = decltype(cutlass::detail::sm90_trivial_blockwise_scale_config(GsFp8TileShape{}));
-using GsLayoutSFA    = decltype(GsScaleConfig::deduce_layoutSFA());
-using GsLayoutSFB    = decltype(GsScaleConfig::deduce_layoutSFB());
-
-using GsKernelSchedule  = cutlass::gemm::KernelTmaWarpSpecializedCooperativeFP8BlockScaledAccum;
-using GsEpilogueSchedule = cutlass::epilogue::TmaWarpSpecializedCooperative;
-
-using GsFp8CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
-    cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp,
-    GsFp8TileShape, CholClusterShape,
-    cutlass::epilogue::collective::EpilogueTileAuto,
-    float, float,
-    float, cutlass::layout::ColumnMajor, 4,
-    float, cutlass::layout::ColumnMajor, 4,
-    GsEpilogueSchedule
->::CollectiveOp;
-
-using GsFp8CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
-    cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp,
-    cutlass::float_e4m3_t, cute::tuple<cutlass::layout::RowMajor, GsLayoutSFA>, 16,
-    cutlass::float_e4m3_t, cute::tuple<cutlass::layout::ColumnMajor, GsLayoutSFB>, 16,
-    float, GsFp8TileShape, CholClusterShape,
-    cutlass::gemm::collective::StageCountAutoCarveout<
-        static_cast<int>(sizeof(typename GsFp8CollectiveEpilogue::SharedStorage))>,
-    GsKernelSchedule
->::CollectiveOp;
-
-using GsFp8GemmKernel = cutlass::gemm::kernel::GemmUniversal<
-    Shape<int,int,int,int>, GsFp8CollectiveMainloop, GsFp8CollectiveEpilogue>;
-using GsFp8CutlassGemm = cutlass::gemm::device::GemmUniversalAdapter<GsFp8GemmKernel>;
-
-
-// ═══════════════════════════════════════════════════════════════════
-//  CUTLASS GEMM runners — generic (FP16, FP8 tensorwise)
-//
-//  Takes external workspace to avoid cudaMalloc/Free per call.
-// ═══════════════════════════════════════════════════════════════════
-template <typename CutlassGemmT, bool AlphaOnDevice = false>
-void run_cutlass_gemm(int M, int N, int K,
-                      const void* d_A, const void* d_B,
-                      float* d_C, int ldc,
-                      std::conditional_t<AlphaOnDevice, const float*, float> alpha,
-                      float beta,
-                      void* workspace,
-                      cudaStream_t stream = 0)
-{
-    using StrideA  = typename CutlassGemmT::GemmKernel::StrideA;
-    using StrideB  = typename CutlassGemmT::GemmKernel::StrideB;
-    using StrideC  = typename CutlassGemmT::GemmKernel::StrideC;
-    using StrideD  = typename CutlassGemmT::GemmKernel::StrideD;
-    using ElementA = typename CutlassGemmT::GemmKernel::ElementA;
-    using ElementB = typename CutlassGemmT::GemmKernel::ElementB;
-
-    StrideA sa = cutlass::make_cute_packed_stride(StrideA{}, {M, K, 1});
-    StrideB sb = cutlass::make_cute_packed_stride(StrideB{}, {N, K, 1});
-    StrideC sc = cutlass::make_cute_packed_stride(StrideC{}, {M, N, 1});
-    StrideD sd = cutlass::make_cute_packed_stride(StrideD{}, {M, N, 1});
-
-    if (ldc != M) {
-        cute::get<1>(sc) = ldc;
-        cute::get<1>(sd) = ldc;
-    }
-
-    // Construct args with zeroed epilogue thread fields, fill them below.
-    // Avoids EpilogueOutputOp::Params which is a CUTLASS 2.x concept —
-    // in CUTLASS 3.x the fusion op (LinearCombination) exposes ::Arguments,
-    // accessible via args.epilogue.thread.
-    typename CutlassGemmT::Arguments args{
-        cutlass::gemm::GemmUniversalMode::kGemm, {M, N, K, 1},
-        { reinterpret_cast<const ElementA*>(d_A), sa,
-          reinterpret_cast<const ElementB*>(d_B), sb },
-        { {}, d_C, sc, d_C, sd }
-    };
-
-    auto& th = args.epilogue.thread;   // cutlass::epilogue::fusion::LinearCombination::Arguments
-    th.beta     = beta;
-    th.beta_ptr = nullptr;             // beta always from host
-
-    if constexpr (AlphaOnDevice) {
-        th.alpha     = 1.0f;           // ignored when alpha_ptr != nullptr
-        th.alpha_ptr = alpha;          // alpha is const float* here
-    } else {
-        th.alpha     = alpha;          // alpha is float here
-        th.alpha_ptr = nullptr;
-    }
-
-    CutlassGemmT op;
-#ifndef NDEBUG
-    CUTLASS_CHECK(op.can_implement(args));
-#endif
-    CUTLASS_CHECK(op.initialize(args, workspace, stream));
-    CUTLASS_CHECK(op.run(stream));
-}
-
-// ═══════════════════════════════════════════════════════════════════
-//  CUTLASS GEMM runner — blockwise-scaled FP8
-// ═══════════════════════════════════════════════════════════════════
-
-inline void run_cutlass_gemm_gsfp8(
-        int M, int N, int K,
-        const __nv_fp8_e4m3* d_A,
-        const __nv_fp8_e4m3* d_B,
-        const float*          d_sfa,
-        const float*          d_sfb,
-        float*                d_C,
-        int                   ldc,
-        float                 alpha,
-        float                 beta,
-        void*                 workspace,
-        cudaStream_t          stream = 0)
-{
-    using GemmOp  = GsFp8CutlassGemm;
-    using Fp8     = cutlass::float_e4m3_t;
-    using StrideA = typename GemmOp::GemmKernel::StrideA;
-    using StrideB = typename GemmOp::GemmKernel::StrideB;
-    using StrideC = typename GemmOp::GemmKernel::StrideC;
-    using StrideD = typename GemmOp::GemmKernel::StrideD;
-
-    StrideA sa = cutlass::make_cute_packed_stride(StrideA{}, {M, K, 1});
-    StrideB sb = cutlass::make_cute_packed_stride(StrideB{}, {N, K, 1});
-    StrideC sc = cutlass::make_cute_packed_stride(StrideC{}, {M, N, 1});
-    StrideD sd = cutlass::make_cute_packed_stride(StrideD{}, {M, N, 1});
-    if (ldc != M) {
-        cute::get<1>(sc) = ldc;
-        cute::get<1>(sd) = ldc;
-    }
-
-    auto lsfa = GsScaleConfig::tile_atom_to_shape_SFA(
-                    cute::make_shape(M, N, K, 1));
-    auto lsfb = GsScaleConfig::tile_atom_to_shape_SFB(
-                    cute::make_shape(M, N, K, 1));
-
-    typename GemmOp::Arguments args {
-        cutlass::gemm::GemmUniversalMode::kGemm,
-        {M, N, K, 1},
-        { reinterpret_cast<const Fp8*>(d_A), sa,
-          reinterpret_cast<const Fp8*>(d_B), sb,
-          d_sfa, lsfa,
-          d_sfb, lsfb },
-        { {alpha, beta}, d_C, sc, d_C, sd }
-    };
-
-    GemmOp op;
-#ifndef NDEBUG
-    CUTLASS_CHECK(op.can_implement(args));
-#endif
-    CUTLASS_CHECK(op.initialize(args, workspace, stream));
-    CUTLASS_CHECK(op.run(stream));
-}
-
-// ═══════════════════════════════════════════════════════════════════
-//  Non-template wrappers for CUTLASS GEMMs
-//  (Avoids dependent-name parsing errors when called from templates)
-// ═══════════════════════════════════════════════════════════════════
-
-inline void run_fp16_gemm(int M, int N, int K, const void* A, const void* B,
-                           float* C, int ldc, float alpha, float beta,
-                           void* ws, cudaStream_t stream = 0) {
-    run_cutlass_gemm<Fp16CutlassGemm>(M, N, K, A, B, C, ldc, alpha, beta, ws, stream);
-}
-
-inline void run_fp8_gemm_scaled(int M, int N, int K, const void* A, const void* B,
-                                 float* C, int ldc, const float* alpha, float beta,
-                                 void* ws, cudaStream_t stream = 0) {
-    run_cutlass_gemm<Fp8CutlassGemm, true>(M, N, K, A, B, C, ldc, alpha, beta, ws, stream);
-}
-
-inline void run_fp8_gemm(int M, int N, int K, const void* A, const void* B,
-                           float* C, int ldc, float alpha, float beta,
-                           void* ws, cudaStream_t stream = 0) {
-    run_cutlass_gemm<Fp8CutlassGemm>(M, N, K, A, B, C, ldc, alpha, beta, ws, stream);
-}
-
-
-// ═══════════════════════════════════════════════════════════════════
-//  Persistent GEMM launchers — for repeated same-shape calls
-// ═══════════════════════════════════════════════════════════════════
-
-// Generic launcher for FP16 / FP8 tensorwise (no scale factors)
-template <typename CutlassGemmT>
-class CutlassGemmLauncher {
-public:
-    using GemmOp   = CutlassGemmT;
-    using ElementA = typename GemmOp::GemmKernel::ElementA;
-    using ElementB = typename GemmOp::GemmKernel::ElementB;
-    using StrideA  = typename GemmOp::GemmKernel::StrideA;
-    using StrideB  = typename GemmOp::GemmKernel::StrideB;
-    using StrideC  = typename GemmOp::GemmKernel::StrideC;
-    using StrideD  = typename GemmOp::GemmKernel::StrideD;
-
-    void configure(int M, int N, int K, int ldc,
-                   float alpha, float beta,
-                   void* workspace, cudaStream_t stream = 0) {
-        M_ = M; N_ = N; K_ = K; ldc_ = ldc;
-        alpha_ = alpha; beta_ = beta; workspace_ = workspace;
-        sa_ = cutlass::make_cute_packed_stride(StrideA{}, {M, K, 1});
-        sb_ = cutlass::make_cute_packed_stride(StrideB{}, {N, K, 1});
-        sc_ = cutlass::make_cute_packed_stride(StrideC{}, {M, N, 1});
-        sd_ = cutlass::make_cute_packed_stride(StrideD{}, {M, N, 1});
-        if (ldc != M) { cute::get<1>(sc_) = ldc; cute::get<1>(sd_) = ldc; }
-#ifndef NDEBUG
-        auto args = make_args(nullptr, nullptr, nullptr);
-        CUTLASS_CHECK(op_.can_implement(args));
-#endif
-        configured_ = true;
-    }
-
-    void run(const void* d_A, const void* d_B, float* d_C,
-             cudaStream_t stream = 0) {
-        assert(configured_ && "call configure() first");
-        auto args = make_args(d_A, d_B, d_C);
-        CUTLASS_CHECK(op_.initialize(args, workspace_, stream));
-        CUTLASS_CHECK(op_.run(stream));
-    }
-
-private:
-    typename GemmOp::Arguments make_args(
-            const void* d_A, const void* d_B, float* d_C) const {
-        return {
-            cutlass::gemm::GemmUniversalMode::kGemm, {M_, N_, K_, 1},
-            { reinterpret_cast<const ElementA*>(d_A), sa_,
-              reinterpret_cast<const ElementB*>(d_B), sb_ },
-            { {alpha_, beta_}, d_C, sc_, d_C, sd_ }
-        };
-    }
-    GemmOp op_{}; int M_{}, N_{}, K_{}, ldc_{};
-    float alpha_{}, beta_{}; void* workspace_{};
-    StrideA sa_{}; StrideB sb_{}; StrideC sc_{}; StrideD sd_{};
-    bool configured_{false};
-};
-
-// Blockwise-scaled FP8 launcher
-class GsFp8GemmLauncher {
-public:
-    using GemmOp  = GsFp8CutlassGemm;
-    using Fp8     = cutlass::float_e4m3_t;
-    using StrideA = typename GemmOp::GemmKernel::StrideA;
-    using StrideB = typename GemmOp::GemmKernel::StrideB;
-    using StrideC = typename GemmOp::GemmKernel::StrideC;
-    using StrideD = typename GemmOp::GemmKernel::StrideD;
-
-    void configure(int M, int N, int K, int ldc,
-                   float alpha, float beta,
-                   void* workspace, cudaStream_t stream = 0) {
-        M_ = M; N_ = N; K_ = K; ldc_ = ldc;
-        alpha_ = alpha; beta_ = beta; workspace_ = workspace;
-        sa_ = cutlass::make_cute_packed_stride(StrideA{}, {M, K, 1});
-        sb_ = cutlass::make_cute_packed_stride(StrideB{}, {N, K, 1});
-        sc_ = cutlass::make_cute_packed_stride(StrideC{}, {M, N, 1});
-        sd_ = cutlass::make_cute_packed_stride(StrideD{}, {M, N, 1});
-        if (ldc != M) { cute::get<1>(sc_) = ldc; cute::get<1>(sd_) = ldc; }
-        lsfa_ = GsScaleConfig::tile_atom_to_shape_SFA(cute::make_shape(M, N, K, 1));
-        lsfb_ = GsScaleConfig::tile_atom_to_shape_SFB(cute::make_shape(M, N, K, 1));
-#ifndef NDEBUG
-        auto args = make_args(nullptr, nullptr, nullptr, nullptr, nullptr);
-        CUTLASS_CHECK(op_.can_implement(args));
-#endif
-        configured_ = true;
-    }
-
-    void run(const __nv_fp8_e4m3* d_A, const __nv_fp8_e4m3* d_B,
-             const float* d_sfa, const float* d_sfb,
-             float* d_C, cudaStream_t stream = 0) {
-        assert(configured_ && "call configure() first");
-        auto args = make_args(d_A, d_B, d_sfa, d_sfb, d_C);
-        CUTLASS_CHECK(op_.initialize(args, workspace_, stream));
-        CUTLASS_CHECK(op_.run(stream));
-    }
-
-private:
-    typename GemmOp::Arguments make_args(
-            const __nv_fp8_e4m3* d_A, const __nv_fp8_e4m3* d_B,
-            const float* d_sfa, const float* d_sfb, float* d_C) const {
-        return {
-            cutlass::gemm::GemmUniversalMode::kGemm, {M_, N_, K_, 1},
-            { reinterpret_cast<const Fp8*>(d_A), sa_,
-              reinterpret_cast<const Fp8*>(d_B), sb_,
-              d_sfa, lsfa_, d_sfb, lsfb_ },
-            { {alpha_, beta_}, d_C, sc_, d_C, sd_ }
-        };
-    }
-    GemmOp op_{}; int M_{}, N_{}, K_{}, ldc_{};
-    float alpha_{}, beta_{}; void* workspace_{};
-    StrideA sa_{}; StrideB sb_{}; StrideC sc_{}; StrideD sd_{};
-    decltype(GsScaleConfig::tile_atom_to_shape_SFA(cute::make_shape(0,0,0,0))) lsfa_{};
-    decltype(GsScaleConfig::tile_atom_to_shape_SFB(cute::make_shape(0,0,0,0))) lsfb_{};
-    bool configured_{false};
-};
-
-
-// ── Warp-level max using shuffle (no shared memory needed) ──────────────────
-__device__ __forceinline__ float warp_reduce_max(float v) {
-    v = fmaxf(v, __shfl_xor_sync(0xffffffff, v, 16));
-    v = fmaxf(v, __shfl_xor_sync(0xffffffff, v,  8));
-    v = fmaxf(v, __shfl_xor_sync(0xffffffff, v,  4));
-    v = fmaxf(v, __shfl_xor_sync(0xffffffff, v,  2));
-    v = fmaxf(v, __shfl_xor_sync(0xffffffff, v,  1));
-    return v;
-}
-
-// ── Warp-per-tile: each warp owns one (bm,bk) tile ──────────────────────────
-// Launch: grid( ceil(n_tiles / WARPS_PER_CTA) ), threads( WARPS_PER_CTA * 32 )
-// One CTA covers WARPS_PER_CTA tiles simultaneously.
-template<int WARPS_PER_CTA>
-__global__ void fp32_to_fp8_blockscaled_warp_per_tile(
-    __nv_fp8_e4m3* __restrict__ dst,
-    float*         __restrict__ scales,
-    const float*   __restrict__ src,
-    int rows, int cols,
-    int ld_src, int ld_dst,
-    int scale_block_m, int scale_block_k,
-    int n_scale_m,     int n_scale_k)
-{
-    const int lane    = threadIdx.x & 31;
-    const int wid     = threadIdx.x >> 5;
-    const int tile_id = blockIdx.x * WARPS_PER_CTA + wid;
-    const int n_tiles = n_scale_m * n_scale_k;
-
-    if (tile_id >= n_tiles) return;
-
-    const int bm = tile_id % n_scale_m;
-    const int bk = tile_id / n_scale_m;
-
-    const int row_start  = bm * scale_block_m;
-    const int col_start  = bk * scale_block_k;
-    const int row_end    = min(row_start + scale_block_m, rows);
-    const int col_end    = min(col_start + scale_block_k, cols);
-    const int block_rows = row_end - row_start;
-    const int block_cols = col_end - col_start;
-    const int block_elems = block_rows * block_cols;
-
-    // ── Pass 1: amax via pure warp shuffle — zero smem ─────────────────────
-    float local_max = 0.f;
-    for (int i = lane; i < block_elems; i += 32) {
-        const int row_local = i % block_rows;
-        const int col_local = i / block_rows;
-        local_max = fmaxf(local_max,
-            fabsf(src[(size_t)(col_start + col_local) * ld_src
-                             + (row_start + row_local)]));
-    }
-    // All 32 lanes get the warp max (every shfl_xor step is collective)
-    local_max = warp_reduce_max(local_max);
-
-    const float scale     = (local_max > 9.76562500e-04f*16.0f) ? (local_max / 448.f) : 1.f;
-    const float inv_scale = 1.f / scale;
-
-    if (lane == 0) scales[bk * n_scale_m + bm] = scale;
-
-    // ── Pass 2: quantize + coalesced write ──────────────────────────────────
-    for (int i = lane; i < block_elems; i += 32) {
-        const int row_local = i / block_cols;
-        const int col_local = i % block_cols;
-        float v = src[(size_t)(col_start + col_local) * ld_src
-                             + (row_start + row_local)] * inv_scale;
-        v = fminf(fmaxf(v, -448.f), 448.f);
-        dst[(size_t)(row_start + row_local) * ld_dst
-                   + (col_start + col_local)] = __nv_fp8_e4m3(v);
-    }
-}
 
 __global__ void hasNaN_kernel(const double* __restrict__ data, int n, int lda, int* has_nan) {
-    // Each thread handles one (row, col) and strides through rows
     int col = blockIdx.x * blockDim.x + threadIdx.x;
     int row = blockIdx.y * blockDim.y + threadIdx.y;
     int stride_row = blockDim.y * gridDim.y;
@@ -2064,333 +2044,66 @@ __global__ void hasNaN_kernel(const double* __restrict__ data, int n, int lda, i
     }
 }
 
-// ── Variant for small grids (total tiles < threshold) ───────────────────────
-// No data cache in smem → only NUM_WARPS*4 bytes reserved → max occupancy.
-// Two global passes are fine: the total data is tiny.
-template<int BLOCK_DIM>
-__global__ void fp32_to_fp8_blockscaled_kernel_small(
-    __nv_fp8_e4m3* __restrict__ dst,
-    float*         __restrict__ scales,
-    const float*   __restrict__ src,
-    int rows, int cols,
-    int ld_src, int ld_dst,
-    int scale_block_m, int scale_block_k,
-    int n_scale_m,     int n_scale_k)
-{
-    constexpr int NUM_WARPS = BLOCK_DIM / 32;
-
-    const int bm  = blockIdx.x,  bk  = blockIdx.y;
-    const int tid = threadIdx.x, wid = tid >> 5, lane = tid & 31;
-
-    const int row_start  = bm * scale_block_m;
-    const int col_start  = bk * scale_block_k;
-    const int row_end    = min(row_start + scale_block_m, rows);
-    const int col_end    = min(col_start + scale_block_k, cols);
-    const int block_rows = row_end - row_start;
-    const int block_cols = col_end - col_start;
-    const int block_elems = block_rows * block_cols;
-
-    // Only cross-warp scratch — 32 bytes for 8 warps, negligible occupancy cost
-    __shared__ float warp_maxes[NUM_WARPS];
-
-    // ── Pass 1: find amax ───────────────────────────────────────────────────
-    float local_max = 0.f;
-    for (int i = tid; i < block_elems; i += BLOCK_DIM) {
-        const int row_local = i % block_rows;
-        const int col_local = i / block_rows;
-        local_max = fmaxf(local_max,
-            fabsf(src[(size_t)(col_start + col_local) * ld_src
-                             + (row_start + row_local)]));
-    }
-    local_max = warp_reduce_max(local_max);      // shuffle — no smem needed
-    if (lane == 0) warp_maxes[wid] = local_max;
-    __syncthreads();
-
-    if (wid == 0) {
-        float v = (lane < NUM_WARPS) ? warp_maxes[lane] : 0.f;
-        v = warp_reduce_max(v);
-        if (lane == 0) warp_maxes[0] = v;
-    }
-    __syncthreads();
-
-    const float amax      = warp_maxes[0];
-    const float scale     = (amax > 9.76562500e-04f*16.0f) ? (amax / 448.f) : 1.f;
-    const float inv_scale = 1.f / scale;
-
-    if (tid == 0) scales[bk * n_scale_m + bm] = scale;
-
-    // ── Pass 2: quantize → dst, row-major for coalesced writes ─────────────
-    // src read is strided here, but for small tile sizes L1 absorbs it cleanly
-    for (int i = tid; i < block_elems; i += BLOCK_DIM) {
-        const int row_local = i / block_cols;   // row-major: coalesced dst write
-        const int col_local = i % block_cols;
-        float v = src[(size_t)(col_start + col_local) * ld_src
-                             + (row_start + row_local)] * inv_scale;
-        v = fminf(fmaxf(v, -448.f), 448.f);
-        dst[(size_t)(row_start + row_local) * ld_dst
-                   + (col_start + col_local)] = __nv_fp8_e4m3(v);
-    }
-}
-
-template<int BLOCK_DIM>
-__global__ void fp32_to_fp8_blockscaled_kernel_opt(
-    __nv_fp8_e4m3* __restrict__ dst,
-    float*         __restrict__ scales,
-    const float*   __restrict__ src,
-    int rows, int cols,
-    int ld_src, int ld_dst,
-    int scale_block_m, int scale_block_k,
-    int n_scale_m,     int n_scale_k)
-{
-    constexpr int NUM_WARPS = BLOCK_DIM / 32;
-
-    const int bm  = blockIdx.x,  bk  = blockIdx.y;
-    const int tid = threadIdx.x, wid = tid >> 5, lane = tid & 31;
-
-    const int row_start  = bm * scale_block_m;
-    const int col_start  = bk * scale_block_k;
-    const int row_end    = min(row_start + scale_block_m, rows);
-    const int col_end    = min(col_start + scale_block_k, cols);
-    const int block_rows = row_end - row_start;
-    const int block_cols = col_end - col_start;
-    const int block_elems = block_rows * block_cols;
-
-    // +1 padding on the row dimension eliminates shared-memory bank conflicts
-    // when block_rows is a multiple of 32 (e.g. 32, 64, 128).
-    const int padded_rows = block_rows + 1;
-
-    extern __shared__ float shmem[];
-    float* data_cache = shmem;                        // [col * padded_rows + row]
-    float* warp_maxes = shmem + padded_rows * block_cols; // [NUM_WARPS]
-
-    // ── Pass 1: load src → shared memory, accumulate local amax ────────────
-    // src is column-major: src[col * ld_src + row].
-    // Iterating i = col_local * block_rows + row_local gives coalesced reads:
-    // consecutive threads differ by 1 in row_local within the same column.
-    float local_max = 0.0f;
-
-    for (int i = tid; i < block_elems; i += BLOCK_DIM) {
-        const int row_local = i % block_rows;
-        const int col_local = i / block_rows;
-        const float v = src[(size_t)(col_start + col_local) * ld_src
-                            +          (row_start + row_local)];
-        // Store col-major with padding to avoid bank conflicts on read-back
-        data_cache[col_local * padded_rows + row_local] = v;
-        local_max = fmaxf(local_max, fabsf(v));
-    }
-
-    // ── Reduction: warp shuffle → inter-warp via smem ──────────────────────
-    local_max = warp_reduce_max(local_max);
-    if (lane == 0) warp_maxes[wid] = local_max;
-    __syncthreads();
-
-    if (wid == 0) {
-        float v = (lane < NUM_WARPS) ? warp_maxes[lane] : 0.0f;
-        v = warp_reduce_max(v);
-        if (lane == 0) warp_maxes[0] = v;   // broadcast result via smem
-    }
-    __syncthreads();
-
-    const float amax      = warp_maxes[0];
-    const float scale     = (amax > 9.76562500e-04f*16.0f) ? (amax / 448.f) : 1.f;
-    const float inv_scale = 1.f / scale;
-
-    if (tid == 0) scales[bk * n_scale_m + bm] = scale;
-
-    // ── Pass 2: quantize from smem → dst (row-major, coalesced writes) ──────
-    // Iterate row-major: row_local = i / block_cols, col_local = i % block_cols.
-    // Consecutive threads share the same row_local and differ by 1 in col_local,
-    // so writes to dst[row * ld_dst + col] are stride-1 → fully coalesced.
-    for (int i = tid; i < block_elems; i += BLOCK_DIM) {
-        const int row_local = i / block_cols;
-        const int col_local = i % block_cols;
-
-        // Smem read: col-major with padding (bank-conflict-free)
-        float v = data_cache[col_local * padded_rows + row_local] * inv_scale;
-        v = fminf(fmaxf(v, -448.f), 448.f);
-
-        // Coalesced write: consecutive threads → consecutive column addresses
-        dst[(size_t)(row_start + row_local) * ld_dst
-                   + (col_start + col_local)] = __nv_fp8_e4m3(v);
-    }
-}
-
-inline void launch_fp32_to_fp8_blockscaled(
-    __nv_fp8_e4m3* dst, float* scales, const float* src,
-    int rows, int cols, int ld_src, int ld_dst,
-    int scale_block_m, int scale_block_k,
-    int n_scale_m, int n_scale_k,
-    cudaStream_t stream)
-{
-    constexpr int BLOCK_DIM      = 256;
-    constexpr int NUM_WARPS      = BLOCK_DIM / 32;  // 8
-    constexpr int WARPS_PER_CTA  = 8;               // for warp-per-tile kernel
-    // Tune these thresholds based on your GPU:
-    constexpr int WARP_TILE_THRESHOLD  = 8;   // ≤ 8 tiles  → warp-per-tile
-    constexpr int SMALL_TILE_THRESHOLD = 32;  // ≤ 32 tiles → small kernel
-
-    const int total_tiles = n_scale_m * n_scale_k;
-    dim3 grid(n_scale_m, n_scale_k);
-
-    if (total_tiles <= WARP_TILE_THRESHOLD) {
-        // One CTA, warps split the tiles — zero smem, zero cudaFuncSetAttribute
-        int ctas = (total_tiles + WARPS_PER_CTA - 1) / WARPS_PER_CTA;
-        fp32_to_fp8_blockscaled_warp_per_tile<WARPS_PER_CTA>
-            <<<ctas, WARPS_PER_CTA * 32, 0, stream>>>(
-                dst, scales, src, rows, cols, ld_src, ld_dst,
-                scale_block_m, scale_block_k, n_scale_m, n_scale_k);
-
-    } else if (total_tiles <= SMALL_TILE_THRESHOLD) {
-        // Normal grid but no data cache — 32 bytes smem, full occupancy
-        fp32_to_fp8_blockscaled_kernel_small<BLOCK_DIM>
-            <<<grid, BLOCK_DIM, NUM_WARPS * sizeof(float), stream>>>(
-                dst, scales, src, rows, cols, ld_src, ld_dst,
-                scale_block_m, scale_block_k, n_scale_m, n_scale_k);
-
-    }  else {
-        // Large grid — full smem cache, coalesced everything
-        const int padded_rows = scale_block_m + 1;
-        size_t smem = (size_t(padded_rows) * scale_block_k + NUM_WARPS) * sizeof(float);
-
-        // ← this was missing: must opt in before the 48 KB default limit is exceeded
-        CUDA_CHECK(cudaFuncSetAttribute(
-            fp32_to_fp8_blockscaled_kernel_opt<BLOCK_DIM>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize,
-            smem));
-
-        fp32_to_fp8_blockscaled_kernel_opt<BLOCK_DIM>
-            <<<grid, BLOCK_DIM, smem, stream>>>(
-                dst, scales, src, rows, cols, ld_src, ld_dst,
-                scale_block_m, scale_block_k, n_scale_m, n_scale_k);
-    }
-    CUDA_CHECK(cudaGetLastError());
-}
-
 // ═══════════════════════════════════════════════════════════════════
-//  GemmWorkspace — pre-allocates all buffers for the Cholesky loop
+//  GemmWorkspace — per-call buffers for the adaptive Cholesky.
+//  cuBLASLt handle/workspace lives in the global CublasLtContext.
 // ═══════════════════════════════════════════════════════════════════
 
 struct GemmWorkspace {
-    void*  convert_buf;
-    size_t convert_buf_bytes;
+    // Row-major FP16 or FP8 staging panel.
+    void*  fp_staging;
+    size_t fp_staging_bytes;
 
-    float* scale_A;
-    float* scale_B;
-    size_t scale_bytes;
+    // Per-row scales for FP8 path (OUTER_VEC_32F mode).
+    // One FP32 per row of A.  Sized for the largest panel: n rows max.
+    float* scales;
+    size_t scales_bytes;
 
-    void*  cutlass_ws;
-    size_t cutlass_ws_bytes;
-
-    // Temporary float buffer for GEMM output when trailing matrix is double
+    // FP32 temp for low-prec GEMM output when trailing matrix is FP64
+    // (used by FP16, TF32, FP32 branches).
     float* gemm_temp;
     size_t gemm_temp_bytes;
 
-    // Temporary float buffer for panel cast (double → float) before low-prec convert
+    // BF16 temp for FP8 GEMM output (cuBLASLt FP8 with row-wise scaling
+    // produces BF16/FP16 output, not FP32).
+    __nv_bfloat16* gemm_temp_bf16;
+    size_t          gemm_temp_bf16_bytes;
+
+    // FP32 cast of the FP64 panel before low-prec quantization.
     float* panel_f32;
     size_t panel_f32_bytes;
 
-    void allocate(int n, int nb, bool need_f64_temps = false) {
-        convert_buf_bytes = sizeof(__half) * (size_t)n * nb;
-        CUDA_CHECK(cudaMalloc(&convert_buf, convert_buf_bytes));
+    void allocate(int n, int nb, bool need_f64_temps) {
+        fp_staging_bytes = sizeof(__half) * (size_t)n * nb;
+        CUDA_CHECK(cudaMalloc(&fp_staging, fp_staging_bytes));
 
-        int max_nsm = (n + 127) / 128;
-        int max_nsk = (nb + 127) / 128;
-        scale_bytes = sizeof(float) * (size_t)max_nsm * max_nsk;
-        CUDA_CHECK(cudaMalloc(&scale_A, scale_bytes));
-        CUDA_CHECK(cudaMalloc(&scale_B, scale_bytes));
+        // Row-wise FP8 scaling: one FP32 per row, up to n rows.
+        scales_bytes  = sizeof(float) * (size_t)n;
+        CUDA_CHECK(cudaMalloc(&scales, scales_bytes));
 
-        // Compute max workspace across all three CUTLASS kernel types
-        cutlass_ws_bytes = 0;
+        // FP8 GEMM output: cuBLASLt's row-wise scaled FP8 produces
+        // BF16/FP16, not FP32.  Allocate BF16 trailing-matrix-sized buffer.
+        gemm_temp_bf16_bytes = sizeof(__nv_bfloat16) * (size_t)n * n;
+        CUDA_CHECK(cudaMalloc(&gemm_temp_bf16, gemm_temp_bf16_bytes));
 
-        // Block-scaled FP8
-        {
-            using GemmOp = GsFp8CutlassGemm;
-            using StrideA = typename GemmOp::GemmKernel::StrideA;
-            using StrideB = typename GemmOp::GemmKernel::StrideB;
-            using StrideC = typename GemmOp::GemmKernel::StrideC;
-            using StrideD = typename GemmOp::GemmKernel::StrideD;
-            StrideA sa = cutlass::make_cute_packed_stride(StrideA{}, {n, nb, 1});
-            StrideB sb = cutlass::make_cute_packed_stride(StrideB{}, {n, nb, 1});
-            StrideC sc = cutlass::make_cute_packed_stride(StrideC{}, {n, n, 1});
-            StrideD sd = cutlass::make_cute_packed_stride(StrideD{}, {n, n, 1});
-            auto lsfa = GsScaleConfig::tile_atom_to_shape_SFA(make_shape(n, n, nb, 1));
-            auto lsfb = GsScaleConfig::tile_atom_to_shape_SFB(make_shape(n, n, nb, 1));
-            typename GemmOp::Arguments args{
-                cutlass::gemm::GemmUniversalMode::kGemm, {n, n, nb, 1},
-                { nullptr, sa, nullptr, sb, nullptr, lsfa, nullptr, lsfb },
-                { {1.0f, 0.0f}, nullptr, sc, nullptr, sd }
-            };
-            cutlass_ws_bytes = GemmOp::get_workspace_size(args);
-        }
-        // FP16
-        {
-            using GemmOp = Fp16CutlassGemm;
-            using StrideA = typename GemmOp::GemmKernel::StrideA;
-            using StrideB = typename GemmOp::GemmKernel::StrideB;
-            using StrideC = typename GemmOp::GemmKernel::StrideC;
-            using StrideD = typename GemmOp::GemmKernel::StrideD;
-            StrideA sa = cutlass::make_cute_packed_stride(StrideA{}, {n, nb, 1});
-            StrideB sb = cutlass::make_cute_packed_stride(StrideB{}, {n, nb, 1});
-            StrideC sc = cutlass::make_cute_packed_stride(StrideC{}, {n, n, 1});
-            StrideD sd = cutlass::make_cute_packed_stride(StrideD{}, {n, n, 1});
-            typename GemmOp::Arguments args{
-                cutlass::gemm::GemmUniversalMode::kGemm, {n, n, nb, 1},
-                { nullptr, sa, nullptr, sb },
-                { {1.0f, 0.0f}, nullptr, sc, nullptr, sd }
-            };
-            size_t ws16 = GemmOp::get_workspace_size(args);
-            if (ws16 > cutlass_ws_bytes) cutlass_ws_bytes = ws16;
-        }
-        // FP8 tensorwise
-        {
-            using GemmOp = Fp8CutlassGemm;
-            using StrideA = typename GemmOp::GemmKernel::StrideA;
-            using StrideB = typename GemmOp::GemmKernel::StrideB;
-            using StrideC = typename GemmOp::GemmKernel::StrideC;
-            using StrideD = typename GemmOp::GemmKernel::StrideD;
-            StrideA sa = cutlass::make_cute_packed_stride(StrideA{}, {n, nb, 1});
-            StrideB sb = cutlass::make_cute_packed_stride(StrideB{}, {n, nb, 1});
-            StrideC sc = cutlass::make_cute_packed_stride(StrideC{}, {n, n, 1});
-            StrideD sd = cutlass::make_cute_packed_stride(StrideD{}, {n, n, 1});
-            typename GemmOp::Arguments args{
-                cutlass::gemm::GemmUniversalMode::kGemm, {n, n, nb, 1},
-                { nullptr, sa, nullptr, sb },
-                { {1.0f, 0.0f}, nullptr, sc, nullptr, sd }
-            };
-            size_t ws8 = GemmOp::get_workspace_size(args);
-            if (ws8 > cutlass_ws_bytes) cutlass_ws_bytes = ws8;
-        }
-
-        cutlass_ws = nullptr;
-        if (cutlass_ws_bytes > 0)
-            CUDA_CHECK(cudaMalloc(&cutlass_ws, cutlass_ws_bytes));
-
-        // Allocate temps for FP64-max adaptive path
-        gemm_temp = nullptr;
-        gemm_temp_bytes = 0;
-        panel_f32 = nullptr;
-        panel_f32_bytes = 0;
+        gemm_temp = nullptr;     gemm_temp_bytes = 0;
+        panel_f32 = nullptr;     panel_f32_bytes = 0;
         if (need_f64_temps) {
-            // GEMM temp: mr x mr float for the largest possible trailing update
             gemm_temp_bytes = sizeof(float) * (size_t)n * n;
             CUDA_CHECK(cudaMalloc(&gemm_temp, gemm_temp_bytes));
-
-            // Panel temp: mr x nb float
             panel_f32_bytes = sizeof(float) * (size_t)n * nb;
             CUDA_CHECK(cudaMalloc(&panel_f32, panel_f32_bytes));
         }
     }
 
     void free() {
-        if (convert_buf) { cudaFree(convert_buf); convert_buf = nullptr; }
-        if (scale_A)     { cudaFree(scale_A);     scale_A     = nullptr; }
-        if (scale_B)     { cudaFree(scale_B);     scale_B     = nullptr; }
-        if (cutlass_ws)  { cudaFree(cutlass_ws);  cutlass_ws  = nullptr; }
-        if (gemm_temp)   { cudaFree(gemm_temp);   gemm_temp   = nullptr; }
-        if (panel_f32)   { cudaFree(panel_f32);   panel_f32   = nullptr; }
+        if (fp_staging)     { cudaFree(fp_staging);     fp_staging     = nullptr; }
+        if (scales)         { cudaFree(scales);         scales         = nullptr; }
+        if (gemm_temp)      { cudaFree(gemm_temp);      gemm_temp      = nullptr; }
+        if (gemm_temp_bf16) { cudaFree(gemm_temp_bf16); gemm_temp_bf16 = nullptr; }
+        if (panel_f32)      { cudaFree(panel_f32);      panel_f32      = nullptr; }
     }
 };
-
 
 // ═══════════════════════════════════════════════════════════════════
 //  Cholesky factorization routines
@@ -2424,61 +2137,67 @@ void chol_cusolver_fp64(float* d_A32, int n) {
     CUSOLVER_CHECK(cusolverDnDestroy(sv));
 }
 
-// 2) Templated mixed-precision blocked Cholesky (FP16 or FP8 tensorwise)
-template <typename LowT, typename CutlassGemmT, bool DoPerturbDiag = false>
-void chol_blocked_mixed(float* d_A, int n, int nb) {
+// 2) Mixed FP16 Cholesky preconditioner (baseline)
+//    Uses cuBLASLt FP16 GEMM with FP32 accumulation.
+void chol_blocked_mixed_fp16(float* d_A, int n, int nb,
+                              GemmWorkspace& ws,
+                              cudaStream_t stream = 0)
+{
     cusolverDnHandle_t sv; cublasHandle_t bl;
     CUSOLVER_CHECK(cusolverDnCreate(&sv)); CUBLAS_CHECK(cublasCreate(&bl));
+    CUBLAS_CHECK(cublasSetStream(bl, stream));
+    CUSOLVER_CHECK(cusolverDnSetStream(sv, stream));
+
     int lw = 0;
-    CUSOLVER_CHECK(cusolverDnSpotrf_bufferSize(sv, CUBLAS_FILL_MODE_LOWER, nb, d_A, n, &lw));
+    CUSOLVER_CHECK(cusolverDnSpotrf_bufferSize(
+        sv, CUBLAS_FILL_MODE_LOWER, nb, d_A, n, &lw));
     float* dW; int* dI;
     CUDA_CHECK(cudaMalloc(&dW, sizeof(float) * std::max(lw, 1)));
     CUDA_CHECK(cudaMalloc(&dI, sizeof(int)));
 
-    float* d_scales;
-    CUDA_CHECK(cudaMalloc((void**)&d_scales, sizeof(float)*(n + QUANT_TILE - 1)*(nb + QUANT_TILE - 1)/(QUANT_TILE*QUANT_TILE)));
-
-    // Pre-allocate workspace for the entire factorization
-    GemmWorkspace ws;
-    ws.allocate(n, nb);
-
     for (int j = 0; j < n; j += nb) {
         int jb = std::min(nb, n - j);
         float* Ajj = d_A + (size_t)j * n + j;
-        CUSOLVER_CHECK(cusolverDnSpotrf(sv, CUBLAS_FILL_MODE_LOWER, jb, Ajj, n, dW, lw, dI));
+
+        CUSOLVER_CHECK(cusolverDnSpotrf(
+            sv, CUBLAS_FILL_MODE_LOWER, jb, Ajj, n, dW, lw, dI));
         if (j + jb >= n) break;
-        int mr = n - j - jb;
-        float* Ap = d_A + (size_t)j * n + (j + jb);
-        float* At = d_A + (size_t)(j + jb) * n + (j + jb);
-        float one = 1.f;
+
+        int   mr = n - j - jb;
+        float one_f = 1.f;
+        float* Ap = d_A + (size_t)j      * n + (j + jb);
+        float* At = d_A + (size_t)(j+jb) * n + (j + jb);
         CUBLAS_CHECK(cublasStrsm(bl, CUBLAS_SIDE_RIGHT, CUBLAS_FILL_MODE_LOWER,
-                                 CUBLAS_OP_T, CUBLAS_DIAG_NON_UNIT, mr, jb, &one, Ajj, n, Ap, n));
+                                 CUBLAS_OP_T, CUBLAS_DIAG_NON_UNIT,
+                                 mr, jb, &one_f, Ajj, n, Ap, n));
 
-        // Convert panel to low precision and do GEMM update
-        LowT* dP = reinterpret_cast<LowT*>(ws.convert_buf);
-        launch_convert<LowT>(dP, Ap, d_scales, mr, jb, n, jb);
+        // FP32 panel (col-major, ld=n) → __half row-major (ld=jb)
+        __half* p16 = reinterpret_cast<__half*>(ws.fp_staging);
+        launch_convert<__half>(p16, Ap, ws.scales,
+                                mr, jb, n, jb, stream);
 
-        if constexpr (DoPerturbDiag) {
-            perturb_trailing_diagonal(At, Ap, mr, jb, n,
-                9.76562500e-04f*16.0f, 9.76562500e-04f*16.0f);
-        }
-
-        run_cutlass_gemm<CutlassGemmT>(mr, mr, jb, dP, dP, At, n,
-                                        -1.f, 1.f, ws.cutlass_ws);
+        // FP16 GEMM via cuBLASLt: At -= p16 * p16^T
+        g_fp16_gemm.run(mr, mr, jb,
+                        p16, jb,
+                        p16, jb,
+                        At,  n,
+                        -1.f, 1.f, stream);
     }
-    CUDA_CHECK(cudaDeviceSynchronize());
-    ws.free();
+
+    CUDA_CHECK(cudaStreamSynchronize(stream));
     CUDA_CHECK(cudaFree(dW)); CUDA_CHECK(cudaFree(dI));
-    CUBLAS_CHECK(cublasDestroy(bl)); CUSOLVER_CHECK(cusolverDnDestroy(sv));
+    CUBLAS_CHECK(cublasDestroy(bl));
+    CUSOLVER_CHECK(cusolverDnDestroy(sv));
 }
 
 // 3) Adaptive-precision Hybrid Cholesky
 struct AdaptiveStats {
-    int    step_counts[PREC_COUNT];   // FP8, FP16, TF32, FP32, FP64
+    int    step_counts[PREC_COUNT];
     double flops[PREC_COUNT];
     double total_flops;
+    int    n_panels;          // number of panel steps with a Schur update
+    int    n_nonpos_panels;   // panels where the pivot floor fired (nonpos_pivot)
 };
-
 
 float cuda_event_elapsed_ms(cudaEvent_t start, cudaEvent_t stop) {
     float ms;
@@ -2489,19 +2208,26 @@ float cuda_event_elapsed_ms(cudaEvent_t start, cudaEvent_t stop) {
 // ═══════════════════════════════════════════════════════════════════
 //  Adaptive-precision Hybrid Cholesky — templated on HighT
 //
-//  HighT = double:  A stored in FP64, panel factorized with Dpotrf,
+//  HighT = double:  A stored in FP64, panel factorized with potf2_panel<double>,
 //                   low-prec GEMMs output to temp float buffer then
 //                   accumulated into the double trailing matrix.
 //                   FP64 GEMM uses cublasDgemm directly.
 //
 //  HighT = float:   Original behaviour — everything in FP32.
+//
+//  Low-precision GEMMs all go through cuBLASLt:
+//    FP8  → g_fp8_gemm   (1-D block scaled, 128-along-K)
+//    FP16 → g_fp16_gemm
+//    TF32/FP32 → cublasSgemm
+//    FP64 → cublasDgemm (only meaningful for HighT=double)
 // ═══════════════════════════════════════════════════════════════════
 
 template <typename HighT>
 void chol_blocked_adaptive(HighT* d_A, int n, int nb,
                            float c, float eps_prime, bool use_mx,
                            bool verbose = false,
-                           AdaptiveStats* out_stats = nullptr) {
+                           AdaptiveStats* out_stats = nullptr,
+                           const PanelLogCtx* panel_log = nullptr) {
     static_assert(std::is_same_v<HighT, float> || std::is_same_v<HighT, double>,
                   "HighT must be float or double");
     constexpr bool is_f64 = std::is_same_v<HighT, double>;
@@ -2513,22 +2239,31 @@ void chol_blocked_adaptive(HighT* d_A, int n, int nb,
     ws.allocate(n, nb, /*need_f64_temps=*/is_f64);
 
     // Diagonal buffers — always double for precision selection
-    double *d_orig_diag, *d_updated_diag;
+    double *d_orig_diag, *d_updated_diag, *d_spent;
+    float *d_g_coeff, *d_omega;
+    CUDA_CHECK(cudaMalloc(&d_g_coeff, sizeof(float) * 5));
+    CUDA_CHECK(cudaMalloc(&d_omega,   sizeof(float) * 5));
     CUDA_CHECK(cudaMalloc(&d_orig_diag,    sizeof(double) * n));
     CUDA_CHECK(cudaMalloc(&d_updated_diag, sizeof(double) * n));
+    CUDA_CHECK(cudaMalloc(&d_spent, sizeof(double) * n));
+    CUDA_CHECK(cudaMemset(d_spent, 0, sizeof(double) * n));  // zero once at start; updated incrementally on device
 
-    // Panel factorization info
     int* dI_panel;
     CUDA_CHECK(cudaMalloc(&dI_panel, sizeof(int)));
 
-    float* d_scales;
-    CUDA_CHECK(cudaMalloc((void**)&d_scales, sizeof(float)*(n + QUANT_TILE - 1)*(nb + QUANT_TILE - 1)/(QUANT_TILE*QUANT_TILE)));
+#ifdef COUNT_UNDERFLOW
+    // Per-row FP8 underflow tally for the whole L matrix, accumulated
+    // across every panel step that quantizes that row (a trailing row
+    // gets FP8-quantized once per step until it becomes part of a panel).
+    int* d_row_underflow;
+    CUDA_CHECK(cudaMalloc(&d_row_underflow, sizeof(int) * n));
+    CUDA_CHECK(cudaMemset(d_row_underflow, 0, sizeof(int) * n));
+#endif
 
     // Extract diagonal (always into double)
     if constexpr (is_f64) {
         extract_diagonal_f64(d_orig_diag, d_A, n, n);
     } else {
-        // Extract float diagonal, cast to double
         float* d_diag_f32;
         CUDA_CHECK(cudaMalloc(&d_diag_f32, sizeof(float) * n));
         extract_diagonal(d_diag_f32, d_A, n, n);
@@ -2545,42 +2280,57 @@ void chol_blocked_adaptive(HighT* d_A, int n, int nb,
 
     int    prec_counts[PREC_COUNT] = {};
     double prec_flops[PREC_COUNT]  = {};
+    int    n_panels_logged   = 0;   // panels with a Schur update (per-panel rows)
+    int    n_nonpos_panels   = 0;   // panels whose factorization floored a pivot
 
-    // One-time cudaFuncSetAttribute for the large-tile fp8 quantization kernel
-    {
-        constexpr int BLOCK_DIM = 256;
-        constexpr int NUM_WARPS = BLOCK_DIM / 32;
-        const int padded_rows   = 128 + 1;
-        size_t smem = (size_t(padded_rows) * 128 + NUM_WARPS) * sizeof(float);
-        CUDA_CHECK(cudaFuncSetAttribute(
-            fp32_to_fp8_blockscaled_kernel_opt<BLOCK_DIM>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize,
-            smem));
-    }
-   auto prec_to_beta_delta = [](PrecisionChoice p) -> std::pair<double, double> {
-    // δ = β = 16 × smallest positive subnormal of the target precision.
-    // This guards against quantization underflow when the trailing
-    // diagonal is cast down into the low-precision format.
-    switch (p) {
-        case PREC_FP8:  return {16.0 * 1.953125e-3,   16.0 * 1.953125e-3};    // E4M3  subnormal = 2^-9
-        case PREC_FP16: return {16.0 * 5.9604645e-8,  16.0 * 5.9604645e-8};   // FP16  subnormal = 2^-24
-        case PREC_TF32: return {16.0 * 1.4012985e-45, 16.0 * 1.4012985e-45};  // FP32 subnormal range
-        case PREC_FP32: return {16.0 * 1.4012985e-45, 16.0 * 1.4012985e-45};  // FP32 subnormal = 2^-149
-        case PREC_FP64: return {16.0 * 4.9406565e-324,16.0 * 4.9406565e-324}; // FP64 subnormal = 2^-1074
-        default:        return {16.0 * 1.953125e-3,   16.0 * 1.953125e-3};
-    }
-};
+    // Perturbation parameters for the panel factorization.
+    // These are keyed to the precision used in the PREVIOUS step's
+    // trailing-matrix update — that's the step that introduced
+    // quantization error into the current panel.
+    //
+    // FP16 and above are precise enough that no perturbation is needed:
+    // we use a huge beta and zero delta so the floor only fires on a
+    // truly indefinite pivot (the existing safety net in potf2_panel).
+    //
+    // FP8 is where perturbation actually earns its keep — quantization
+    // error can drive trailing-matrix diagonals slightly negative.
+    auto prec_to_beta_delta = [](PrecisionChoice p) -> std::pair<double, double> {
+        switch (p) {
+            case PREC_FP8:
+                // Per-step FP8 epsilon: ~1.95e-3 (E4M3), inflated 16x for headroom.
+                return {16.0 * 1.953125e-3, 16.0 * 1.953125e-3};
+            default:
+                // FP16, TF32, FP32, FP64: no perturbation.
+                // Huge beta -> row_term ~= 0; zero delta -> only floor on
+                // ajj <= 0 (the safety net inside potf2_panel).
+                return {99999999.0, 0.0};
+        }
+    };
 
-
+    // `prev_prec` is updated at the END of each iteration to record what
+    // precision was used for the trailing-matrix update of THIS step.
+    // The NEXT iteration reads it to decide whether to perturb.
+    PrecisionChoice prev_prec = PREC_FP64;   // initial: no perturbation
 
     for (int j = 0; j < n; j += nb) {
         int jb = std::min(nb, n - j);
         HighT* Ajj = d_A + (size_t)j * n + j;
-        PrecisionChoice prev_prec = PREC_FP32;
-        auto [beta_val, delta_val] = prec_to_beta_delta(prev_prec);  // or prev_prec; see below
 
-        // Panel factorization
-        potrf_panel<HighT>(Ajj, jb, n, 99999999.0, 0.0, bl, dI_panel);
+        // Choose perturbation parameters based on the precision that
+        // produced this panel's data.
+        auto [beta_val, delta_val] = prec_to_beta_delta(prev_prec);
+
+        // Panel factorization with the chosen perturbation.
+        potrf_panel<HighT>(Ajj, jb, n,
+                           (HighT)beta_val, (HighT)delta_val,
+                           bl, dI_panel);
+
+        // potf2_panel writes (last sub-block's) info: nonzero => a
+        // non-positive pivot was floored to keep the panel SPD.
+        int h_panel_info = 0;
+        CUDA_CHECK(cudaMemcpy(&h_panel_info, dI_panel, sizeof(int),
+                              cudaMemcpyDeviceToHost));
+        const char* panel_status = (h_panel_info != 0) ? "nonpos_pivot" : "ok";
 
         if (j + jb >= n) break;
 
@@ -2601,142 +2351,120 @@ void chol_blocked_adaptive(HighT* d_A, int n, int nb,
                                      &one, (float*)Ajj, n, (float*)Ap, n));
         }
 
-        // Precision selection — always uses double diagonal buffers
+        // Precision selection
         int trailing_start = j + jb;
         PrecisionChoice prec;
         if constexpr (is_f64) {
             prec = select_precision_for_step_f64(
-                d_updated_diag, d_orig_diag, (double*)Ap,
+                d_updated_diag, d_orig_diag, d_spent, (double*)Ap,
                 trailing_start, mr, jb, n,
-                c, eps_prime, use_mx,
+                c, eps_prime, nb*exp2(-53.0), prev_prec, use_mx, d_g_coeff, d_omega,
                 d_block_masks, d_result_mask);
         } else {
-            // For float path, cast Ap temporarily... or just default to FP32.
-            // (The float-max path uses the old select_precision_for_step;
-            //  but that's a placeholder now.  For correctness just use FP32.)
             prec = PREC_FP32;
         }
 
         double step_flops = 2.0 * (double)mr * (double)mr * (double)jb;
         prec_counts[prec]++;
         prec_flops[prec] += step_flops;
+        n_panels_logged++;
+        if (h_panel_info != 0) n_nonpos_panels++;
+
+        // Per-panel log (INSTRUMENTATION §1) — one append-only row per panel
+        // step, emitted right after precision is selected for the Schur update.
+        // flops_executed is the GEMM count (~2x SYRK); flops_syrk_equiv = /2.
+        if (panel_log && panel_log->fp) {
+            fprintf(panel_log->fp,
+                "%ld,%s,%s,%d,%.6e,%d,%.6e,%.6e,%d,%d,%.6e,%.6e,%s,%d,%s\n",
+                panel_log->run_id, panel_log->matrix_id, panel_log->spectrum_type,
+                panel_log->n, panel_log->kappa, panel_log->nb,
+                panel_log->eps_prime, panel_log->c_underflow,
+                j / nb,                          // panel_index (0-based)
+                mr,                              // trailing_size m_j
+                step_flops,                      // flops_executed f_j
+                step_flops / 2.0,                // flops_syrk_equiv
+                precision_name(prec),            // selected_precision
+                mantissa_bits_for_prec(prec),    // mantissa_bits
+                panel_status);                   // panel_status
+            fflush(panel_log->fp);
+        }
 
         if (verbose) {
             printf("  Step j=%d  mr=%d  jb=%d  -> %s  (%.3e FLOPs)\n",
                    j, mr, jb, precision_name(prec), step_flops);
         }
 
-        // For low-precision GEMMs when HighT=double, we need:
-        //   1) Cast panel Ap (double, ld=n) → panel_f32 (float, ld=mr)
-        //   2) Convert float panel → low-prec
-        //   3) GEMM → gemm_temp (float, ld=mr)
-        //   4) Accumulate: At -= gemm_temp  (double += float)
-        // For FP32 GEMM: cast panel, Sgemm → gemm_temp, accumulate
-        // For FP64 GEMM: Dgemm directly on At
-
-        prev_prec = prec;  // for next iteration's diagonal perturbation
+        prev_prec = prec;
 
         switch (prec) {
             case PREC_FP8: {
-                float* panel32 = is_f64 ? ws.panel_f32 : (float*)Ap;
-                int ld_panel32 = is_f64 ? mr : n;
+                float* panel32   = is_f64 ? ws.panel_f32 : (float*)Ap;
+                int    ld_panel32 = is_f64 ? mr : n;
 
                 if constexpr (is_f64) {
                     cast_f64_to_f32_matrix(ws.panel_f32, (double*)Ap, mr, jb, mr, n);
                 }
 
-                if (use_mx) {
-                    constexpr int BLOCK_DIM  = 256;
-                    constexpr int SCALE_BM   = 128;
-                    constexpr int SCALE_BK   = 128;
-                    int nsm = (mr + SCALE_BM - 1) / SCALE_BM;
-                    int nsk = (jb + SCALE_BK - 1) / SCALE_BK;
+                __nv_fp8_e4m3* p8 = reinterpret_cast<__nv_fp8_e4m3*>(ws.fp_staging);
+                fp8bs1d::launch(p8, ws.scales, panel32,
+                                mr, jb, ld_panel32, 0
+#ifdef COUNT_UNDERFLOW
+                                , d_row_underflow + trailing_start
+#endif
+                                );
 
-                    const int padded_rows = SCALE_BM + 1;
-                    size_t smem_bytes = (size_t(padded_rows) * SCALE_BK + 8) * sizeof(float);
+                // GEMM into BF16 workspace.  C = 1 * L * L^T + 0
+                g_fp8_gemm.run(mr, mr, jb,
+                               p8, p8,
+                               ws.scales, ws.scales,
+                               ws.gemm_temp_bf16, /*ldd=*/mr,
+                               1.f, 0.f, 0);
 
-                    fp32_to_fp8_blockscaled_kernel_opt<BLOCK_DIM>
-                        <<<dim3(nsm, nsk), BLOCK_DIM, smem_bytes>>>(
-                            reinterpret_cast<__nv_fp8_e4m3*>(ws.convert_buf), ws.scale_A,
-                            panel32, mr, jb, ld_panel32, jb,
-                            SCALE_BM, SCALE_BK, nsm, nsk);
-                    CUDA_CHECK(cudaGetLastError());
-
-                    if constexpr (is_f64) {
-                        // GEMM → gemm_temp, then accumulate into double At
-                        CUDA_CHECK(cudaMemset(ws.gemm_temp, 0, sizeof(float) * (size_t)mr * mr));
-                        run_cutlass_gemm_gsfp8(mr, mr, jb,
-                            reinterpret_cast<__nv_fp8_e4m3*>(ws.convert_buf),
-                            reinterpret_cast<__nv_fp8_e4m3*>(ws.convert_buf),
-                            ws.scale_A, ws.scale_A, ws.gemm_temp, mr, 1.f, 0.f,
-                            ws.cutlass_ws);
-                        accumulate_f32_into_f64_matrix((double*)At, ws.gemm_temp, mr, n, mr, -1.0);
-                    } else {
-                        run_cutlass_gemm_gsfp8(mr, mr, jb,
-                            reinterpret_cast<__nv_fp8_e4m3*>(ws.convert_buf),
-                            reinterpret_cast<__nv_fp8_e4m3*>(ws.convert_buf),
-                            ws.scale_A, ws.scale_A, (float*)At, n, -1.f, 1.f,
-                            ws.cutlass_ws);
-                    }
+                // Accumulate -BF16 into the trailing matrix.
+                if constexpr (is_f64) {
+                    accumulate_bf16_into_f64_matrix(
+                        (double*)At, ws.gemm_temp_bf16, mr, n, mr, -1.0);
                 } else {
-                    __nv_fp8_e4m3* p8 = reinterpret_cast<__nv_fp8_e4m3*>(ws.convert_buf);
-                    launch_convert<__nv_fp8_e4m3>(p8, panel32, d_scales, mr, jb, ld_panel32, jb);
-
-                    if constexpr (is_f64) {
-                        CUDA_CHECK(cudaMemset(ws.gemm_temp, 0, sizeof(float) * (size_t)mr * mr));
-                        run_fp8_gemm_scaled(mr, mr, jb, p8, p8,
-                            ws.gemm_temp, mr, d_scales, 0.f, ws.cutlass_ws);
-                        accumulate_f32_into_f64_matrix((double*)At, ws.gemm_temp, mr, n, mr, -1.0);
-                    } else {
-                        run_fp8_gemm_scaled(mr, mr, jb, p8, p8,
-                            (float*)At, n, d_scales, 1.f, ws.cutlass_ws);
-                    }
+                    accumulate_bf16_into_f32_matrix(
+                        (float*)At, ws.gemm_temp_bf16, mr, n, mr, -1.f);
                 }
-
-               
                 break;
             }
 
             case PREC_FP16: {
-                float* panel32 = is_f64 ? ws.panel_f32 : (float*)Ap;
-                int ld_panel32 = is_f64 ? mr : n;
+                float* panel32    = is_f64 ? ws.panel_f32 : (float*)Ap;
+                int    ld_panel32 = is_f64 ? mr : n;
 
                 if constexpr (is_f64) {
                     cast_f64_to_f32_matrix(ws.panel_f32, (double*)Ap, mr, jb, mr, n);
                 }
 
-                __half* p16 = reinterpret_cast<__half*>(ws.convert_buf);
-                launch_convert<__half>(p16, panel32, d_scales, mr, jb, ld_panel32, jb);
-                CUDA_CHECK(cudaGetLastError());
+                __half* p16 = reinterpret_cast<__half*>(ws.fp_staging);
+                launch_convert<__half>(p16, panel32, ws.scales,
+                                        mr, jb, ld_panel32, jb);
 
                 if constexpr (is_f64) {
-                    CUDA_CHECK(cudaMemset(ws.gemm_temp, 0, sizeof(float) * (size_t)mr * mr));
-                    run_fp16_gemm(mr, mr, jb, p16, p16,
-                        ws.gemm_temp, mr, 1.f, 0.f, ws.cutlass_ws);
-                    accumulate_f32_into_f64_matrix((double*)At, ws.gemm_temp, mr, n, mr, -1.0);
+                    CUDA_CHECK(cudaMemset(ws.gemm_temp, 0,
+                                          sizeof(float) * (size_t)mr * mr));
+                    g_fp16_gemm.run(mr, mr, jb,
+                                    p16, jb,
+                                    p16, jb,
+                                    ws.gemm_temp, mr,
+                                    1.f, 0.f, 0);
+                    accumulate_f32_into_f64_matrix(
+                        (double*)At, ws.gemm_temp, mr, n, mr, -1.0);
                 } else {
-                    run_fp16_gemm(mr, mr, jb, p16, p16,
-                        (float*)At, n, -1.f, 1.f, ws.cutlass_ws);
+                    g_fp16_gemm.run(mr, mr, jb,
+                                    p16, jb,
+                                    p16, jb,
+                                    (float*)At, n,
+                                    -1.f, 1.f, 0);
                 }
-                
-                //  if constexpr (is_f64) {
-                //     // Perturbation for FP8: cast panel to float for perturb kernel
-                //     // (panel_f32 already has the cast)
-                //     // We need a float view of the diagonal... skip perturbation for f64
-                //     // or implement a double version
-                //     perturb_trailing_diagonal_f64((double*)At, (double*)Ap, mr, jb, n,
-                //         9.76562500e-04f*16.0f, 9.76562500e-04f*16.0f, 0);
-                // } else {
-                //     perturb_trailing_diagonal((float*)At, (float*)Ap, mr, jb, n,
-                //         9.76562500e-04f*16.0f, 9.76562500e-04f*16.0f, 0);
-                // }
-
                 break;
             }
 
             case PREC_TF32: {
                 if constexpr (is_f64) {
-                    // Cast panel double→float, Sgemm with TF32, accumulate
                     cast_f64_to_f32_matrix(ws.panel_f32, (double*)Ap, mr, jb, mr, n);
                     float neg = -1.f, zero_f = 0.f;
                     CUBLAS_CHECK(cublasSetMathMode(bl, CUBLAS_TF32_TENSOR_OP_MATH));
@@ -2757,7 +2485,6 @@ void chol_blocked_adaptive(HighT* d_A, int n, int nb,
 
             case PREC_FP32: {
                 if constexpr (is_f64) {
-                    // Cast panel double→float, Sgemm pedantic, accumulate
                     cast_f64_to_f32_matrix(ws.panel_f32, (double*)Ap, mr, jb, mr, n);
                     float neg = -1.f, zero_f = 0.f;
                     CUBLAS_CHECK(cublasSetMathMode(bl, CUBLAS_PEDANTIC_MATH));
@@ -2784,7 +2511,6 @@ void chol_blocked_adaptive(HighT* d_A, int n, int nb,
                         mr, mr, jb, &neg, (double*)Ap, n, (double*)Ap, n,
                         &one_d, (double*)At, n));
                 } else {
-                    // FP64 requested but HighT=float — fall back to FP32 pedantic
                     float neg = -1.f, one_f = 1.f;
                     CUBLAS_CHECK(cublasSetMathMode(bl, CUBLAS_PEDANTIC_MATH));
                     CUBLAS_CHECK(cublasSgemm(bl, CUBLAS_OP_N, CUBLAS_OP_T,
@@ -2793,20 +2519,7 @@ void chol_blocked_adaptive(HighT* d_A, int n, int nb,
                 }
                 break;
             }
-           
         }
-        //  auto [beta_val2, delta_val2] = prec_to_beta_delta(prec);
-        //      if constexpr (is_f64) {
-        //             // Perturbation for FP8: cast panel to float for perturb kernel
-        //             // (panel_f32 already has the cast)
-        //             // We need a float view of the diagonal... skip perturbation for f64
-        //             // or implement a double version
-        //             perturb_trailing_diagonal_f64((double*)At, (double*)Ap, mr, jb, n,
-        //                 (double)beta_val2, (double)delta_val2, 0);
-        //         } else {
-        //             perturb_trailing_diagonal((float*)At, (float*)Ap, mr, jb, n,
-        //                 (float)beta_val2, (float)delta_val2, 0);
-        //         }
     }
 
     double total_flops = 0;
@@ -2837,14 +2550,38 @@ void chol_blocked_adaptive(HighT* d_A, int n, int nb,
             out_stats->step_counts[p] = prec_counts[p];
             out_stats->flops[p]       = prec_flops[p];
         }
-        out_stats->total_flops = total_flops;
+        out_stats->total_flops     = total_flops;
+        out_stats->n_panels        = n_panels_logged;
+        out_stats->n_nonpos_panels = n_nonpos_panels;
     }
 
     CUDA_CHECK(cudaDeviceSynchronize());
+
+#ifdef COUNT_UNDERFLOW
+    {
+        std::vector<int> h_row_underflow(n);
+        CUDA_CHECK(cudaMemcpy(h_row_underflow.data(), d_row_underflow,
+                              sizeof(int) * n, cudaMemcpyDeviceToHost));
+        int worst_row = -1, worst_count = 0;
+        long long total_underflow = 0;
+        for (int i = 0; i < n; i++) {
+            total_underflow += h_row_underflow[i];
+            if (h_row_underflow[i] > worst_count) {
+                worst_count = h_row_underflow[i];
+                worst_row   = i;
+            }
+        }
+        fprintf(stderr,
+            "[fp8bs1d] whole-L underflow: worst row %d with %d underflowed elements, "
+            "%lld total across all FP8 steps\n",
+            worst_row, worst_count, total_underflow);
+    }
+    CUDA_CHECK(cudaFree(d_row_underflow));
+#endif
+
     ws.free();
     CUDA_CHECK(cudaFree(dI_panel));
     CUDA_CHECK(cudaFree(d_orig_diag)); CUDA_CHECK(cudaFree(d_updated_diag));
-    CUDA_CHECK(cudaFree(d_scales));
     CUDA_CHECK(cudaFree(d_block_masks)); CUDA_CHECK(cudaFree(d_result_mask));
     CUBLAS_CHECK(cublasDestroy(bl));
 }
@@ -2859,13 +2596,8 @@ struct PCGResult {
     double time_ms;
     double setup_ms;
 };
-// ═══════════════════════════════════════════════════════════════════
-//  Optimized Preconditioned Conjugate Gradient (FP64)
-// ═══════════════════════════════════════════════════════════════════
 
-// ── Device-side scalar helpers ───────────────────────────────────
-
-// alpha = rz_old / pAp;  neg_alpha = -alpha
+// Device-side scalar helpers
 template<typename T>
 __global__ void compute_alpha_kernel(
     const T* __restrict__ rz_old,
@@ -2878,7 +2610,6 @@ __global__ void compute_alpha_kernel(
     *neg_alpha = -a;
 }
 
-// beta = rz_new / rz_old;  then swap: rz_old = rz_new
 template<typename T>
 __global__ void compute_beta_and_swap_kernel(
     T* __restrict__ rz_old,
@@ -2890,7 +2621,6 @@ __global__ void compute_beta_and_swap_kernel(
     *rz_old = *rz_new;
 }
 
-// Fused: x += alpha * p;  r -= alpha * Ap
 template<typename T>
 __global__ void fused_xr_update_kernel(
     T* __restrict__ x,
@@ -2909,7 +2639,6 @@ __global__ void fused_xr_update_kernel(
     r[i] += na * Ap[i];
 }
 
-// Fused: p = z + beta * p  (replaces scal + axpy)
 template<typename T>
 __global__ void fused_p_update_kernel(
     T* __restrict__ p,
@@ -2922,7 +2651,6 @@ __global__ void fused_p_update_kernel(
     p[i] = z[i] + (*beta) * p[i];
 }
 
-// Check convergence: sets flag[0]=1 if ||r||^2 < (tol*||b||)^2
 template<typename T>
 __global__ void check_convergence_kernel(
     const T* __restrict__ norm_r_sq,
@@ -2931,6 +2659,7 @@ __global__ void check_convergence_kernel(
 {
     *converged = (*norm_r_sq < tol_sq_norm_b_sq) ? 1 : 0;
 }
+
 PCGResult pcg_solve(int n,
                     const double* d_A,
                     const double* d_b,
@@ -2943,14 +2672,12 @@ PCGResult pcg_solve(int n,
     cublasHandle_t blas;
     CUBLAS_CHECK(cublasCreate(&blas));
 
-    // ── Vectors ──────────────────────────────────────────────────
     double *d_r, *d_z, *d_p, *d_Ap;
     CUDA_CHECK(cudaMalloc(&d_r,  sizeof(double) * n));
     CUDA_CHECK(cudaMalloc(&d_z,  sizeof(double) * n));
     CUDA_CHECK(cudaMalloc(&d_p,  sizeof(double) * n));
     CUDA_CHECK(cudaMalloc(&d_Ap, sizeof(double) * n));
 
-    // ── Device scalars (all live on GPU) ─────────────────────────
     double *d_rz_old, *d_rz_new, *d_pAp;
     double *d_alpha, *d_neg_alpha, *d_beta;
     double *d_one, *d_zero;
@@ -2968,7 +2695,6 @@ PCGResult pcg_solve(int n,
     { double h = 1.0; CUDA_CHECK(cudaMemcpy(d_one,  &h, sizeof(double), cudaMemcpyHostToDevice)); }
     { double h = 0.0; CUDA_CHECK(cudaMemcpy(d_zero, &h, sizeof(double), cudaMemcpyHostToDevice)); }
 
-    // ── Helper: apply L^{-1} to a vector (in-place) ─────────────
     auto apply_Linv = [&](double* v) {
         if (d_L != nullptr) {
             CUBLAS_CHECK(cublasDtrsv(blas, CUBLAS_FILL_MODE_LOWER,
@@ -2977,7 +2703,6 @@ PCGResult pcg_solve(int n,
         }
     };
 
-    // ── Helper: apply L^{-T} to a vector (in-place) ─────────────
     auto apply_LTinv = [&](double* v) {
         if (d_L != nullptr) {
             CUBLAS_CHECK(cublasDtrsv(blas, CUBLAS_FILL_MODE_LOWER,
@@ -2986,16 +2711,12 @@ PCGResult pcg_solve(int n,
         }
     };
 
-    // ── Full preconditioner: z = M^{-1} r  =  L^{-T} L^{-1} r ──
     auto apply_precond = [&](const double* src, double* dst) {
         CUDA_CHECK(cudaMemcpy(dst, src, sizeof(double) * n, cudaMemcpyDeviceToDevice));
         apply_Linv(dst);
         apply_LTinv(dst);
     };
 
-    // ── Compute ||L^{-1} b|| on host (once, before timing) ──────
-    // For split PCG, convergence is measured in the preconditioned
-    // norm: ||r̂|| / ||b̂||  where r̂ = L^{-1}r, b̂ = L^{-1}b
     double h_norm_bhat = 0;
     {
         double* d_bhat;
@@ -3009,28 +2730,17 @@ PCGResult pcg_solve(int n,
     }
     if (h_norm_bhat == 0.0) h_norm_bhat = 1.0;
 
-    // Convergence threshold: ||r̂||^2 < (tol * ||b̂||)^2
-    // Note: ||r̂||^2 = ||L^{-1}r||^2 = r^T M^{-1} r = r^T z = rz
     double h_tol_sq_nbhat_sq = (tol * h_norm_bhat) * (tol * h_norm_bhat);
 
-    // ── Switch to DEVICE pointer mode for the solve loop ─────────
     CUBLAS_CHECK(cublasSetPointerMode(blas, CUBLAS_POINTER_MODE_DEVICE));
 
-    // r = b  (x = 0, so r = b - Ax = b)
     CUDA_CHECK(cudaMemcpy(d_r, d_b, sizeof(double) * n, cudaMemcpyDeviceToDevice));
-
-    // z = M^{-1} r
     apply_precond(d_r, d_z);
-
-    // p = z
     CUDA_CHECK(cudaMemcpy(d_p, d_z, sizeof(double) * n, cudaMemcpyDeviceToDevice));
-
-    // rz_old = dot(r, z) = ||L^{-1}r||^2 — stays on device
     CUBLAS_CHECK(cublasDdot(blas, n, d_r, 1, d_z, 1, d_rz_old));
 
     int bl = 256, gr = (n + bl - 1) / bl;
 
-    // ── Timed solve loop ─────────────────────────────────────────
     cudaEvent_t t0, t1;
     CUDA_CHECK(cudaEventCreate(&t0));
     CUDA_CHECK(cudaEventCreate(&t1));
@@ -3041,31 +2751,23 @@ PCGResult pcg_solve(int n,
     int h_converged = 0;
 
     for (iter = 0; iter < max_iter; iter++) {
-        // Ap = A * p
         CUBLAS_CHECK(cublasDgemv(blas, CUBLAS_OP_N, n, n,
                                  d_one, d_A, n, d_p, 1, d_zero, d_Ap, 1));
 
-        // pAp = dot(p, Ap)  — on device
         CUBLAS_CHECK(cublasDdot(blas, n, d_p, 1, d_Ap, 1, d_pAp));
 
-        // alpha = rz_old / pAp;  neg_alpha = -alpha  — on device
         compute_alpha_kernel<double><<<1, 1>>>(d_rz_old, d_pAp, d_alpha, d_neg_alpha);
 
-        // Fused: x += alpha*p;  r -= alpha*Ap
         fused_xr_update_kernel<double><<<gr, bl>>>(d_x, d_r, d_p, d_Ap,
                                                     d_alpha, d_neg_alpha, n);
 
-        // z = M^{-1} r
         apply_precond(d_r, d_z);
 
-        // rz_new = dot(r, z) = ||L^{-1} r_{k+1}||^2  — on device
         CUBLAS_CHECK(cublasDdot(blas, n, d_r, 1, d_z, 1, d_rz_new));
 
-        // ── Split-PCG convergence: ||r̂||^2 = rz_new ─────────────
         bool do_check = ((iter + 1) % check_interval == 0) ||
                         (iter + 1 == max_iter);
         if (do_check) {
-            // rz_new already holds ||L^{-1}r||^2; compare to threshold
             check_convergence_kernel<double><<<1, 1>>>(d_rz_new, h_tol_sq_nbhat_sq, d_converged);
 
             CUDA_CHECK(cudaMemcpyAsync(&h_converged, d_converged, sizeof(int),
@@ -3075,10 +2777,8 @@ PCGResult pcg_solve(int n,
             if (h_converged) { iter++; break; }
         }
 
-        // beta = rz_new / rz_old;  rz_old = rz_new  — on device
         compute_beta_and_swap_kernel<double><<<1, 1>>>(d_rz_old, d_rz_new, d_beta);
 
-        // Fused: p = z + beta * p
         fused_p_update_kernel<double><<<gr, bl>>>(d_p, d_z, d_beta, n);
     }
 
@@ -3087,8 +2787,6 @@ PCGResult pcg_solve(int n,
     float ms = 0;
     CUDA_CHECK(cudaEventElapsedTime(&ms, t0, t1));
 
-    // ── Final residual in preconditioned norm ────────────────────
-    // rel_res = ||L^{-1} r|| / ||L^{-1} b||
     double rel_res = 1.0;
     {
         double* d_rhat;
@@ -3103,7 +2801,6 @@ PCGResult pcg_solve(int n,
         CUDA_CHECK(cudaFree(d_rhat));
     }
 
-    // ── Cleanup ──────────────────────────────────────────────────
     CUDA_CHECK(cudaFree(d_r));
     CUDA_CHECK(cudaFree(d_z));
     CUDA_CHECK(cudaFree(d_p));
@@ -3122,7 +2819,9 @@ PCGResult pcg_solve(int n,
     CUBLAS_CHECK(cublasDestroy(blas));
 
     return {iter, rel_res, (double)ms, 0.0};
-}// ═══════════════════════════════════════════════════════════════════
+}
+
+// ═══════════════════════════════════════════════════════════════════
 //  Command-line parsing
 // ═══════════════════════════════════════════════════════════════════
 struct BenchmarkConfig {
@@ -3132,6 +2831,7 @@ struct BenchmarkConfig {
     int max_iter = 10000;
     double tol   = 1e-10;
     std::string csv_path;
+    std::string panel_csv_path;   // per-panel log (INSTRUMENTATION §1); empty -> derived from csv_path
     float adapt_c         = 1.0f;
     float adapt_eps_prime = 0.1f;
     std::vector<float> eps_list;
@@ -3139,10 +2839,11 @@ struct BenchmarkConfig {
     bool  adapt_verbose   = false;
     double shape_p      = 2.0;
     int    num_clusters = 4;
-    std::vector<std::string> mtx_paths;   // <── NEW
-    int    mtx_max_dim  = 40000;          // <── NEW
+    std::vector<std::string> mtx_paths;
+    int    mtx_max_dim  = 40000;
+    unsigned long long seed = 42ULL;
 };
- 
+
 void print_usage(const char* prog) {
     printf("Usage: %s [options]\n", prog);
     printf("  --n <int>          Matrix size (default: 4096)\n");
@@ -3150,21 +2851,21 @@ void print_usage(const char* prog) {
     printf("  --cond <float>     Condition number (default: 1e6)\n");
     printf("  --max_iter <int>   Max CG iterations (default: 10000)\n");
     printf("  --tol <float>      CG tolerance (default: 1e-10)\n");
-    printf("  --csv <path>       Output CSV file (optional)\n");
+    printf("  --csv <path>       Output per-run CSV file (optional)\n");
+    printf("  --panel_csv <path> Output per-panel CSV file (default: <csv>_panel.csv)\n");
     printf("  --shape_p <float>  Exponent for poly_decay / power_law (default: 2.0)\n");
     printf("  --num_clusters <int>  Clusters for multi_cluster dist (default: 4)\n");
     printf("  --adapt_c <float>       Adaptive: constant c (default: 1.0)\n");
     printf("  --adapt_eps <float>     Adaptive: single eps_prime (default: 0.1)\n");
     printf("  --adapt_eps_list <csv>  Adaptive: comma-separated eps_prime sweep\n");
-    printf("  --adapt_mx              Adaptive: use MXFP8 instead of plain FP8\n");
+    printf("  --adapt_mx              [NO-OP, kept for CLI compatibility — FP8 always uses 1-D block scaling]\n");
     printf("  --adapt_verbose         Adaptive: print per-step precision choices\n");
     printf("  --mtx <path>       Matrix Market file (can specify multiple times)\n");
     printf("  --mtx_max_dim <n>  Max dimension for MTX files (default: 40000)\n");
+    printf("  --seed <int>       RNG seed for synthetic SPD matrix generation (default: 42)\n");
     printf("  --help             Show this help\n");
 }
- 
 
- 
 BenchmarkConfig parse_args(int argc, char** argv) {
     BenchmarkConfig cfg;
     for (int i = 1; i < argc; i++) {
@@ -3180,6 +2881,8 @@ BenchmarkConfig parse_args(int argc, char** argv) {
             cfg.tol = atof(argv[++i]);
         else if (strcmp(argv[i], "--csv") == 0 && i + 1 < argc)
             cfg.csv_path = argv[++i];
+        else if (strcmp(argv[i], "--panel_csv") == 0 && i + 1 < argc)
+            cfg.panel_csv_path = argv[++i];
         else if (strcmp(argv[i], "--shape_p") == 0 && i + 1 < argc)
             cfg.shape_p = atof(argv[++i]);
         else if (strcmp(argv[i], "--num_clusters") == 0 && i + 1 < argc)
@@ -3200,10 +2903,12 @@ BenchmarkConfig parse_args(int argc, char** argv) {
             cfg.adapt_use_mx = true;
         else if (strcmp(argv[i], "--adapt_verbose") == 0)
             cfg.adapt_verbose = true;
-        else if (strcmp(argv[i], "--mtx") == 0 && i + 1 < argc)       // <── NEW
+        else if (strcmp(argv[i], "--mtx") == 0 && i + 1 < argc)
             cfg.mtx_paths.push_back(argv[++i]);
-        else if (strcmp(argv[i], "--mtx_max_dim") == 0 && i + 1 < argc) // <── NEW
+        else if (strcmp(argv[i], "--mtx_max_dim") == 0 && i + 1 < argc)
             cfg.mtx_max_dim = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc)
+            cfg.seed = strtoull(argv[++i], nullptr, 10);
         else if (strcmp(argv[i], "--help") == 0) {
             print_usage(argv[0]);
             exit(0);
@@ -3222,27 +2927,93 @@ BenchmarkConfig parse_args(int argc, char** argv) {
 __global__ void rescale_random_kernel(double* data, int n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) {
-        // Map (0, 1] -> [-1, 1]
         data[idx] = (data[idx] * 2.0) - 1.0;
     }
 }
 
+// ─── Factorization backward error (INSTRUMENTATION §2 `achieved_berr`) ──
+//  max_{i>=j} |a_ij - (L L^T)_ij| / sqrt(a_ii * a_jj).
+//  One block per column j; threads stride over the lower-triangle rows.
+//  Values are non-negative, so we max-reduce on the raw IEEE bit pattern
+//  (monotone for non-negative doubles) with a single atomicMax.
+__global__ void factor_berr_kernel(
+    const double* __restrict__ A,     // original SPD matrix (full, col-major)
+    const double* __restrict__ G,     // L L^T, lower triangle (col-major)
+    const double* __restrict__ diagA, // diagonal of A, length n
+    int n, int lda,
+    unsigned long long* __restrict__ out_bits)
+{
+    int j = blockIdx.x;
+    if (j >= n) return;
+    double ajj = diagA[j];
+    double local = 0.0;
+    for (int i = j + threadIdx.x; i < n; i += blockDim.x) {
+        double aij   = A[(size_t)j * lda + i];
+        double gij   = G[(size_t)j * lda + i];
+        double denom = sqrt(diagA[i] * ajj);
+        double e     = (denom > 0.0) ? fabs(aij - gij) / denom : 0.0;
+        local = fmax(local, e);
+    }
+    __shared__ double sm[256];
+    sm[threadIdx.x] = local;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sm[threadIdx.x] = fmax(sm[threadIdx.x], sm[threadIdx.x + s]);
+        __syncthreads();
+    }
+    if (threadIdx.x == 0)
+        atomicMax(out_bits, (unsigned long long)__double_as_longlong(sm[0]));
+}
+
+static double compute_factor_berr(const double* d_A, const double* d_L,
+                                  int n, cublasHandle_t blas)
+{
+    double *d_G = nullptr, *d_diag = nullptr;
+    unsigned long long *d_bits = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_G,    sizeof(double) * (size_t)n * n));
+    CUDA_CHECK(cudaMalloc(&d_diag, sizeof(double) * n));
+    CUDA_CHECK(cudaMalloc(&d_bits, sizeof(unsigned long long)));
+    CUDA_CHECK(cudaMemset(d_bits, 0, sizeof(unsigned long long)));
+
+    extract_diagonal_f64(d_diag, d_A, n, n);
+
+    cublasPointerMode_t old_mode;
+    cublasGetPointerMode(blas, &old_mode);
+    cublasSetPointerMode(blas, CUBLAS_POINTER_MODE_HOST);
+    double one = 1.0, zero = 0.0;
+    // G = L L^T (lower triangle), L is the n x n lower-triangular factor.
+    CUBLAS_CHECK(cublasDsyrk(blas, CUBLAS_FILL_MODE_LOWER, CUBLAS_OP_N,
+                             n, n, &one, d_L, n, &zero, d_G, n));
+    cublasSetPointerMode(blas, old_mode);
+
+    factor_berr_kernel<<<n, 256>>>(d_A, d_G, d_diag, n, n, d_bits);
+    CUDA_CHECK(cudaGetLastError());
+
+    unsigned long long h_bits = 0;
+    CUDA_CHECK(cudaMemcpy(&h_bits, d_bits, sizeof(h_bits), cudaMemcpyDeviceToHost));
+    cudaFree(d_G); cudaFree(d_diag); cudaFree(d_bits);
+
+    double berr;
+    memcpy(&berr, &h_bits, sizeof(double));   // reinterpret bits -> double
+    return berr;
+}
+
 void run_benchmark_on_matrix(
-    double* d_A64,          // n×n dense SPD matrix (device, not modified)
+    double* d_A64,
     int n,
     const char* matrix_name,
-    const char* dist_label, // "geometric", "mtx:thermal2", etc.
+    const char* dist_label,
     BenchmarkConfig& cfg,
     cublasHandle_t cublas_handle,
     cusolverDnHandle_t cusolver_handle,
     cudaStream_t stream,
-    FILE* csv_fp)
+    FILE* csv_fp,
+    FILE* per_panel_fp)
 {
     size_t elems   = (size_t)n * n;
     size_t bytes64 = sizeof(double) * elems;
     size_t bytes32 = sizeof(float)  * elems;
- 
-    // Allocate working buffers
+
     double *d_b64, *d_x64, *d_L64;
     float  *d_L32, *d_A32_copy;
     CUDA_CHECK(cudaMalloc(&d_b64, sizeof(double) * n));
@@ -3250,61 +3021,60 @@ void run_benchmark_on_matrix(
     CUDA_CHECK(cudaMalloc(&d_L64, bytes64));
     CUDA_CHECK(cudaMalloc(&d_L32, bytes32));
     CUDA_CHECK(cudaMalloc(&d_A32_copy, bytes32));
- 
-    // A32 copy for baseline Cholesky
+
     cast_f64_to_f32(d_A32_copy, d_A64, elems);
     CUDA_CHECK(cudaDeviceSynchronize());
- 
-    // b = rnad()
+
     {
-    // 1. Generate uniform doubles in (0, 1] into d_b64
-    curandGenerator_t gen;
-    CURAND_CHECK(curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_DEFAULT));
-    CURAND_CHECK(curandSetPseudoRandomGeneratorSeed(gen, 1234ULL)); // Or use a variable seed
-    
-    CURAND_CHECK(curandGenerateUniformDouble(gen, d_b64, n));
+        curandGenerator_t gen;
+        CURAND_CHECK(curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_DEFAULT));
+        CURAND_CHECK(curandSetPseudoRandomGeneratorSeed(gen, 1234ULL));
+        CURAND_CHECK(curandGenerateUniformDouble(gen, d_b64, n));
 
-    // 2. Launch custom kernel to rescale to [-1, 1]
-    int threadsPerBlock = 256;
-    int blocksPerGrid = (n + threadsPerBlock - 1) / threadsPerBlock;
-    rescale_random_kernel<<<blocksPerGrid, threadsPerBlock>>>(d_b64, n);
+        int threadsPerBlock = 256;
+        int blocksPerGrid = (n + threadsPerBlock - 1) / threadsPerBlock;
+        rescale_random_kernel<<<blocksPerGrid, threadsPerBlock>>>(d_b64, n);
 
-    // 3. Cleanup
-    CURAND_CHECK(curandDestroyGenerator(gen));
+        CURAND_CHECK(curandDestroyGenerator(gen));
         CUDA_CHECK(cudaDeviceSynchronize());
     }
- 
-    // ── Baselines ────────────────────────────────────────────────
+
     const char* baseline_names[] = { "None", "Dpotrf-FP64", "Mix-FP16" };
- 
+
     printf("\n--- Baselines ---\n");
-    printf("%-12s │ %5s │ %12s │ %10s │ %10s │ %10s\n",
+    printf("%-12s | %5s | %12s | %10s | %10s | %10s\n",
            "Precond", "Iters", "Rel Residual", "Setup (ms)", "PCG (ms)", "Total (ms)");
-    for (int i = 0; i < 75; i++) printf("─");
+    for (int i = 0; i < 75; i++) printf("-");
     printf("\n");
- 
+
     for (int p = 0; p < 3; p++) {
         CUDA_CHECK(cudaMemset(d_x64, 0, sizeof(double) * n));
- 
+
         double setup_ms = 0.0;
         const double* precond_L64 = nullptr;
- 
+
         if (p > 0) {
             CUDA_CHECK(cudaMemcpy(d_L32, d_A32_copy, bytes32, cudaMemcpyDeviceToDevice));
- 
+
             cudaEvent_t s0, s1;
             CUDA_CHECK(cudaEventCreate(&s0));
             CUDA_CHECK(cudaEventCreate(&s1));
             CUDA_CHECK(cudaDeviceSynchronize());
             CUDA_CHECK(cudaEventRecord(s0));
- 
+
             switch (p) {
                 case 1: chol_cusolver_fp64(d_L32, n); break;
-                case 2: chol_blocked_mixed<__half, Fp16CutlassGemm, false>(d_L32, n, cfg.nb); break;
+                case 2: {
+                    GemmWorkspace ws_tmp;
+                    ws_tmp.allocate(n, cfg.nb, /*need_f64_temps=*/false);
+                    chol_blocked_mixed_fp16(d_L32, n, cfg.nb, ws_tmp, stream);
+                    ws_tmp.free();
+                    break;
+                }
             }
             zero_upper_f32(d_L32, n);
             CUDA_CHECK(cudaDeviceSynchronize());
- 
+
             CUDA_CHECK(cudaEventRecord(s1));
             CUDA_CHECK(cudaEventSynchronize(s1));
             float tmp_ms;
@@ -3312,109 +3082,126 @@ void run_benchmark_on_matrix(
             setup_ms = (double)tmp_ms;
             CUDA_CHECK(cudaEventDestroy(s0));
             CUDA_CHECK(cudaEventDestroy(s1));
- 
+
             cast_f32_to_f64(d_L64, d_L32, elems);
             CUDA_CHECK(cudaDeviceSynchronize());
             precond_L64 = d_L64;
         }
 
- 
         PCGResult res = pcg_solve(n, d_A64, d_b64, d_x64,
                                   precond_L64, cfg.max_iter, cfg.tol);
-        
-                                          //print d_x64
-       {
-    double norm_A = 0, norm_x = 0, norm_b = 0, norm_r = 0;
-    double alpha = 1.0, beta = -1.0;
 
-    // 1. Compute ||A||_F (Frobenius norm)
-    // Treating the n x n matrix as one vector of length n*n
-    CUBLAS_CHECK(cublasDnrm2(cublas_handle, n * n, d_A64, 1, &norm_A));
+        double backward_error = -1.0;
+        {
+            double norm_A = 0, norm_x = 0, norm_b = 0, norm_r = 0;
+            double alpha = 1.0, beta = -1.0;
 
-    // 2. Compute ||x||_2
-    CUBLAS_CHECK(cublasDnrm2(cublas_handle, n, d_x64, 1, &norm_x));
+            CUBLAS_CHECK(cublasDnrm2(cublas_handle, n * n, d_A64, 1, &norm_A));
+            CUBLAS_CHECK(cublasDnrm2(cublas_handle, n, d_x64, 1, &norm_x));
+            CUBLAS_CHECK(cublasDnrm2(cublas_handle, n, d_b64, 1, &norm_b));
 
-    // 3. Compute ||b||_2
-    CUBLAS_CHECK(cublasDnrm2(cublas_handle, n, d_b64, 1, &norm_b));
+            double* d_res;
+            CUDA_CHECK(cudaMalloc(&d_res, n * sizeof(double)));
+            CUDA_CHECK(cudaMemcpy(d_res, d_b64, n * sizeof(double), cudaMemcpyDeviceToDevice));
+            CUBLAS_CHECK(cublasDgemv(cublas_handle, CUBLAS_OP_N, n, n,
+                                     &alpha, d_A64, n,
+                                     d_x64, 1,
+                                     &beta, d_res, 1));
+            CUBLAS_CHECK(cublasDnrm2(cublas_handle, n, d_res, 1, &norm_r));
+            backward_error = norm_r / (norm_A * norm_x + norm_b);
 
-    // 4. Compute the residual vector r = Ax - b
-    double* d_res;
-    CUDA_CHECK(cudaMalloc(&d_res, n * sizeof(double)));
-    
-    // Copy b into the residual buffer first
-    CUDA_CHECK(cudaMemcpy(d_res, d_b64, n * sizeof(double), cudaMemcpyDeviceToDevice));
-    
-    // Perform r = 1.0 * A * x + (-1.0) * r  => r = Ax - b
-    CUBLAS_CHECK(cublasDgemv(cublas_handle, CUBLAS_OP_N, n, n, 
-                             &alpha, d_A64, n, 
-                             d_x64, 1, 
-                             &beta, d_res, 1));
+            printf("\n--- Stability Metrics ---\n");
+            printf("  ||Ax - b||:       %.6e\n", norm_r);
+            printf("  ||A||_F:           %.6e\n", norm_A);
+            printf("  Backward Error:    %.6e\n", backward_error);
 
-    // 5. Compute ||r||_2
-    CUBLAS_CHECK(cublasDnrm2(cublas_handle, n, d_res, 1, &norm_r));
-
-    // 6. Calculate Final Backward Error
-    double backward_error = norm_r / (norm_A * norm_x + norm_b);
-
-    printf("\n--- Stability Metrics ---\n");
-    printf("  ||Ax - b||:       %.6e\n", norm_r);
-    printf("  ||A||_F:           %.6e\n", norm_A);
-    printf("  Backward Error:    %.6e\n", backward_error);
-
-    CUDA_CHECK(cudaFree(d_res));
-    }
+            CUDA_CHECK(cudaFree(d_res));
+        }
 
         res.setup_ms = setup_ms;
         double total_ms = res.setup_ms + res.time_ms;
- 
-        printf("%-12s │ %5d │ %12.2e │ %10.1f │ %10.1f │ %10.1f\n",
+
+        // Convergence = PCG reached the relative-residual tolerance (criterion (b)
+        // uses N_iter; here converged matches the solver's own stopping test, so a
+        // non-converged run carries N_iter == max_iters).
+        bool converged = (res.rel_residual <= cfg.tol);
+        const char* status = converged ? "completed" : "cg_not_converged";
+
+        printf("%-12s | %5d | %12.2e | %10.1f | %10.1f | %10.1f\n",
                baseline_names[p], res.iters, res.rel_residual,
                res.setup_ms, res.time_ms, total_ms);
         fflush(stdout);
- 
+
+        long run_id = g_next_run_id++;
         if (csv_fp) {
-            fprintf(csv_fp, "%d,%d,%.1e,0,%s,%s,%d,%.6e,%.3f,%.3f,%.3f,0,0,0,0,0,0\n",
+            // Columns after gemm_flops_total are the INSTRUMENTATION §2 fields.
+            // Baselines carry no adaptive factor, so flops-by-precision and the
+            // factorization achieved_berr are 0 / -1.  rhs is random (b in [-1,1]).
+            fprintf(csv_fp,
+                    "%d,%d,%.1e,0,%s,%s,%d,%.6e,%.3f,%.3f,%.3f,%s,%s,0,0,0,0,0,0,"
+                    "%ld,%.6e,%.6e,%s,%.6e,%d,%s,%d,%d,%d,%d,%.6e,%.6e,%d\n",
                     n, cfg.nb, cfg.cond,
                     dist_label, baseline_names[p], res.iters, res.rel_residual,
-                    res.setup_ms, res.time_ms, total_ms);
+                    res.setup_ms, res.time_ms, total_ms,
+                    /*fact_time_source=*/"measured", /*cg_time_source=*/"measured",
+                    run_id, /*c_underflow=*/0.0, /*kappa=*/cfg.cond,
+                    /*rhs_spec=*/"random", /*solve_tol=*/cfg.tol,
+                    /*max_iters=*/cfg.max_iter, status,
+                    /*factorization_ok=*/1, /*break_panel=*/-1,
+                    /*converged=*/(converged ? 1 : 0), /*N_iter=*/res.iters,
+                    /*achieved_berr=*/-1.0, /*F_S=*/0.0,
+                    /*simulated_construction=*/0);
+            fflush(csv_fp);   // §0: per-run row as-it-happens (crash-safe)
         }
     }
- 
-    // ── Adaptive eps_prime sweep ─────────────────────────────────
+
+    // Adaptive eps_prime sweep
     printf("\n--- Adaptive eps_prime sweep (%d values) ---\n",
            (int)cfg.eps_list.size());
-    printf("%-12s │ %5s │ %12s │ %10s │ %10s │ %10s │%10s │ %8s │ %8s │ %8s | %8s | %8s\n",
-           "eps_prime", "Iters", "Rel Residual", "estimated K(inv(L)*A*inv(L))", "Setup (ms)", "PCG (ms)", "Total (ms)",
+    printf("%-12s | %5s | %12s | %30s | %10s | %10s | %10s | %8s | %8s | %8s | %8s | %8s\n",
+           "eps_prime", "Iters", "Rel Residual", "estimated K(inv(L)*A*inv(L))",
+           "Setup (ms)", "PCG (ms)", "Total (ms)",
            "FP8%", "FP16%", "TF32%", "FP32%", "FP64%");
-    for (int i = 0; i < 115; i++) printf("─");
+    for (int i = 0; i < 145; i++) printf("-");
     printf("\n");
- 
+
     for (int ei = 0; ei < (int)cfg.eps_list.size(); ei++) {
         float eps = cfg.eps_list[ei];
- 
+
         CUDA_CHECK(cudaMemset(d_x64, 0, sizeof(double) * n));
         CUDA_CHECK(cudaMemcpy(d_L64, d_A64, bytes64, cudaMemcpyDeviceToDevice));
- 
+
         AdaptiveStats adaptive_stats = {};
- 
+        long run_id = g_next_run_id++;
+
+        PanelLogCtx panel_ctx;
+        panel_ctx.fp            = per_panel_fp;
+        panel_ctx.run_id        = run_id;
+        panel_ctx.matrix_id     = matrix_name;
+        panel_ctx.spectrum_type = dist_label;
+        panel_ctx.n             = n;
+        panel_ctx.kappa         = cfg.cond;
+        panel_ctx.nb            = cfg.nb;
+        panel_ctx.eps_prime     = (double)eps;
+        panel_ctx.c_underflow   = (double)cfg.adapt_c;
+
         cudaEvent_t s0, s1;
         CUDA_CHECK(cudaEventCreate(&s0));
         CUDA_CHECK(cudaEventCreate(&s1));
         CUDA_CHECK(cudaDeviceSynchronize());
         CUDA_CHECK(cudaEventRecord(s0));
- 
+
         chol_blocked_adaptive<double>(d_L64, n, cfg.nb,
                                       cfg.adapt_c, eps,
                                       cfg.adapt_use_mx, cfg.adapt_verbose,
-                                      &adaptive_stats);
- 
+                                      &adaptive_stats, &panel_ctx);
+
         zero_upper_f64(d_L64, n);
         CUDA_CHECK(cudaDeviceSynchronize());
- 
-        // NaN check
+
+        int h_has_nan = 0;
         {
             int* d_has_nan;
-            int h_has_nan = 0;
             CUDA_CHECK(cudaMalloc((void**)&d_has_nan, sizeof(int)));
             CUDA_CHECK(cudaMemset(d_has_nan, 0, sizeof(int)));
             dim3 hsblock(32, 8);
@@ -3426,7 +3213,13 @@ void run_benchmark_on_matrix(
             if (h_has_nan)
                 printf("  WARNING: NaNs detected in Cholesky factor!\n");
         }
- 
+
+        // Factorization backward error (achieved_berr).  Only meaningful when
+        // the factor is finite; the solve below is also skippable on failure,
+        // but pcg_solve tolerates it and the run row is still recorded.
+        double achieved_berr = h_has_nan ? -1.0
+                              : compute_factor_berr(d_A64, d_L64, n, cublas_handle);
+
         CUDA_CHECK(cudaEventRecord(s1));
         CUDA_CHECK(cudaEventSynchronize(s1));
         float tmp_ms;
@@ -3435,107 +3228,116 @@ void run_benchmark_on_matrix(
         CUDA_CHECK(cudaEventDestroy(s0));
         CUDA_CHECK(cudaEventDestroy(s1));
 
-        auto precond_cond = estimate_kappa(
-        d_A64, d_L64, n, 100,
-        cublas_handle, cusolver_handle);
+#ifdef COND_APPROX
+        double precond_cond = estimate_kappa(
+            d_A64, d_L64, n, 100,
+            cublas_handle, cusolver_handle);
+#else
+        double precond_cond = -1.0;
+#endif
 
         CUDA_CHECK(cudaDeviceSynchronize());
- 
+
         PCGResult res = pcg_solve(n, d_A64, d_b64, d_x64,
                                   d_L64, cfg.max_iter, cfg.tol);
-        //print d_x64
+
+        double backward_error = -1.0;
         {
-    double norm_A = 0, norm_x = 0, norm_b = 0, norm_r = 0;
-    double alpha = 1.0, beta = -1.0;
+            double norm_A = 0, norm_x = 0, norm_b = 0, norm_r = 0;
+            double alpha = 1.0, beta = -1.0;
 
-    // 1. Compute ||A||_F (Frobenius norm)
-    // Treating the n x n matrix as one vector of length n*n
-    CUBLAS_CHECK(cublasDnrm2(cublas_handle, n * n, d_A64, 1, &norm_A));
+            CUBLAS_CHECK(cublasDnrm2(cublas_handle, n * n, d_A64, 1, &norm_A));
+            CUBLAS_CHECK(cublasDnrm2(cublas_handle, n, d_x64, 1, &norm_x));
+            CUBLAS_CHECK(cublasDnrm2(cublas_handle, n, d_b64, 1, &norm_b));
 
-    // 2. Compute ||x||_2
-    CUBLAS_CHECK(cublasDnrm2(cublas_handle, n, d_x64, 1, &norm_x));
+            double* d_res;
+            CUDA_CHECK(cudaMalloc(&d_res, n * sizeof(double)));
+            CUDA_CHECK(cudaMemcpy(d_res, d_b64, n * sizeof(double), cudaMemcpyDeviceToDevice));
+            CUBLAS_CHECK(cublasDgemv(cublas_handle, CUBLAS_OP_N, n, n,
+                                     &alpha, d_A64, n,
+                                     d_x64, 1,
+                                     &beta, d_res, 1));
+            CUBLAS_CHECK(cublasDnrm2(cublas_handle, n, d_res, 1, &norm_r));
+            backward_error = norm_r / (norm_A * norm_x + norm_b);
 
-    // 3. Compute ||b||_2
-    CUBLAS_CHECK(cublasDnrm2(cublas_handle, n, d_b64, 1, &norm_b));
+            printf("\n--- Stability Metrics ---\n");
+            printf("  ||Ax - b||:       %.6e\n", norm_r);
+            printf("  ||A||_F:           %.6e\n", norm_A);
+            printf("  Backward Error:    %.6e\n", backward_error);
 
-    // 4. Compute the residual vector r = Ax - b
-    double* d_res;
-    CUDA_CHECK(cudaMalloc(&d_res, n * sizeof(double)));
-    
-    // Copy b into the residual buffer first
-    CUDA_CHECK(cudaMemcpy(d_res, d_b64, n * sizeof(double), cudaMemcpyDeviceToDevice));
-    
-    // Perform r = 1.0 * A * x + (-1.0) * r  => r = Ax - b
-    CUBLAS_CHECK(cublasDgemv(cublas_handle, CUBLAS_OP_N, n, n, 
-                             &alpha, d_A64, n, 
-                             d_x64, 1, 
-                             &beta, d_res, 1));
-
-    // 5. Compute ||r||_2
-    CUBLAS_CHECK(cublasDnrm2(cublas_handle, n, d_res, 1, &norm_r));
-
-    // 6. Calculate Final Backward Error
-    double backward_error = norm_r / (norm_A * norm_x + norm_b);
-
-    printf("\n--- Stability Metrics ---\n");
-    printf("  ||Ax - b||:       %.6e\n", norm_r);
-    printf("  ||A||_F:           %.6e\n", norm_A);
-    printf("  Backward Error:    %.6e\n", backward_error);
-
-    CUDA_CHECK(cudaFree(d_res));
-}
+            CUDA_CHECK(cudaFree(d_res));
+        }
         res.setup_ms = setup_ms;
         double total_ms = res.setup_ms + res.time_ms;
- 
+
+        // Convergence = PCG reached the relative-residual tolerance (criterion (b)
+        // uses N_iter; non-converged ⇒ N_iter == max_iters).  A completed
+        // factorization that produced NaNs is still recorded with status "nan".
+        bool converged = (res.rel_residual <= cfg.tol);
+        bool factorization_ok = (h_has_nan == 0);
+        const char* status = !factorization_ok ? "nan"
+                           : (converged ? "completed" : "cg_not_converged");
+
         double fp8_pct  = adaptive_stats.total_flops > 0 ? 100.0 * adaptive_stats.flops[PREC_FP8]  / adaptive_stats.total_flops : 0;
         double fp16_pct = adaptive_stats.total_flops > 0 ? 100.0 * adaptive_stats.flops[PREC_FP16] / adaptive_stats.total_flops : 0;
         double tf32_pct = adaptive_stats.total_flops > 0 ? 100.0 * adaptive_stats.flops[PREC_TF32] / adaptive_stats.total_flops : 0;
         double fp32_pct = adaptive_stats.total_flops > 0 ? 100.0 * adaptive_stats.flops[PREC_FP32] / adaptive_stats.total_flops : 0;
         double fp64_pct = adaptive_stats.total_flops > 0 ? 100.0 * adaptive_stats.flops[PREC_FP64] / adaptive_stats.total_flops : 0;
- 
+
         char eps_str[16];
         snprintf(eps_str, sizeof(eps_str), "%.6f", eps);
- 
-        printf("%-12s │ %5d │ %12.2e │ %10.1f │ %10.1f │ %10.1f │ %10.1f │ %7.1f%% │ %7.1f%% │ %7.1f%% | %7.1f%% | %7.1f%%\n",
+
+        printf("%-12s | %5d | %12.2e | %30.1f | %10.1f | %10.1f | %10.1f | %7.1f%% | %7.1f%% | %7.1f%% | %7.1f%% | %7.1f%%\n",
                eps_str, res.iters, res.rel_residual, precond_cond, res.setup_ms, res.time_ms,
                total_ms, fp8_pct, fp16_pct, tf32_pct, fp32_pct, fp64_pct);
         fflush(stdout);
- 
+
         if (csv_fp) {
-            fprintf(csv_fp, "%d,%d,%.1e,%.6e,%s,%s,%d,%.6e,%.3f,%.3f,%.3f,%.4e,%.4e,%.4e,%.4e,%.4e,%.4e\n",
+            fprintf(csv_fp,
+                    "%d,%d,%.1e,%.6e,%s,%s,%d,%.6e,%.3f,%.3f,%.3f,%s,%s,"
+                    "%.4e,%.4e,%.4e,%.4e,%.4e,%.4e,"
+                    "%ld,%.6e,%.6e,%s,%.6e,%d,%s,%d,%d,%d,%d,%.6e,%.6e,%d\n",
                     n, cfg.nb, cfg.cond, (double)eps,
                     dist_label, "Adaptive", res.iters, res.rel_residual,
                     res.setup_ms, res.time_ms, total_ms,
+                    /*fact_time_source=*/"measured", /*cg_time_source=*/"measured",
                     adaptive_stats.flops[PREC_FP8],
                     adaptive_stats.flops[PREC_FP16],
                     adaptive_stats.flops[PREC_TF32],
                     adaptive_stats.flops[PREC_FP32],
                     adaptive_stats.flops[PREC_FP64],
-                    adaptive_stats.total_flops);
+                    adaptive_stats.total_flops,
+                    run_id, (double)cfg.adapt_c, /*kappa=*/cfg.cond,
+                    /*rhs_spec=*/"random", /*solve_tol=*/cfg.tol,
+                    /*max_iters=*/cfg.max_iter, status,
+                    /*factorization_ok=*/(factorization_ok ? 1 : 0),
+                    /*break_panel=*/-1,
+                    /*converged=*/(converged ? 1 : 0), /*N_iter=*/res.iters,
+                    achieved_berr, /*F_S=*/adaptive_stats.flops[PREC_FP8],
+                    /*simulated_construction=*/0);
+            fflush(csv_fp);   // §0: per-run row as-it-happens (crash-safe)
         }
     }
- 
-    // Cleanup
+
     CUDA_CHECK(cudaFree(d_b64));
     CUDA_CHECK(cudaFree(d_x64));
     CUDA_CHECK(cudaFree(d_L64));
     CUDA_CHECK(cudaFree(d_L32));
     CUDA_CHECK(cudaFree(d_A32_copy));
 }
- 
 
 int main(int argc, char** argv) {
     BenchmarkConfig cfg = parse_args(argc, argv);
- 
+
     if (cfg.eps_list.empty())
         cfg.eps_list.push_back(cfg.adapt_eps_prime);
     std::sort(cfg.eps_list.begin(), cfg.eps_list.end(), std::greater<float>());
- 
+
     printf("================================================================\n");
     printf("  PCG Benchmark: nb=%d  max_iter=%d  tol=%.1e\n",
            cfg.nb, cfg.max_iter, cfg.tol);
-    printf("  Adaptive params: c=%.4f  use_mx=%s\n",
-           cfg.adapt_c, cfg.adapt_use_mx ? "yes" : "no");
+    printf("  Adaptive params: c=%.4f  (FP8 always uses 1-D block scaling now)\n",
+           cfg.adapt_c);
     printf("  eps_prime sweep (%d values):", (int)cfg.eps_list.size());
     for (float e : cfg.eps_list) printf(" %.6f", e);
     printf("\n");
@@ -3547,11 +3349,11 @@ int main(int argc, char** argv) {
                cfg.n, cfg.cond, NUM_DISTS);
     }
     printf("================================================================\n\n");
- 
+
     cudaDeviceProp prop;
     CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
     printf("GPU: %s  (SM %d.%d)\n\n", prop.name, prop.major, prop.minor);
- 
+
     cublasHandle_t cublas_handle;
     cusolverDnHandle_t cusolver_handle;
     CUBLAS_CHECK(cublasCreate(&cublas_handle));
@@ -3560,47 +3362,76 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaStreamCreate(&stream));
     CUBLAS_CHECK(cublasSetStream(cublas_handle, stream));
     CUSOLVER_CHECK(cusolverDnSetStream(cusolver_handle, stream));
- 
-    // One-time cudaFuncSetAttribute for blockscaled fp8 kernel
-    {
-        constexpr int BLOCK_DIM = 256;
-        constexpr int NUM_WARPS = BLOCK_DIM / 32;
-        const int padded_rows   = 128 + 1;
-        size_t smem = (size_t(padded_rows) * 128 + NUM_WARPS) * sizeof(float);
-        CUDA_CHECK(cudaFuncSetAttribute(
-            fp32_to_fp8_blockscaled_kernel_opt<BLOCK_DIM>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize,
-            smem));
-    }
- 
+
+    // Initialize cuBLASLt context and persistent GEMM launchers
+    g_lt_ctx.init(/*workspace_bytes=*/32 * 1024 * 1024);
+    g_fp16_gemm.set_context(&g_lt_ctx);
+    g_fp8_gemm .set_context(&g_lt_ctx);
+
     FILE* csv_fp = nullptr;
     if (!cfg.csv_path.empty()) {
-        csv_fp = fopen(cfg.csv_path.c_str(), "w");
-        if (csv_fp) {
+        bool write_header = false;
+        FILE* test = fopen(cfg.csv_path.c_str(), "r");
+        if (!test) { write_header = true; }
+        else { fseek(test, 0, SEEK_END); if (ftell(test) == 0) write_header = true; fclose(test); }
+        csv_fp = fopen(cfg.csv_path.c_str(), "a");
+        if (!csv_fp) {
+            fprintf(stderr, "Cannot open CSV %s\n", cfg.csv_path.c_str());
+        } else if (write_header) {
             fprintf(csv_fp, "n,nb,cond,eps_prime,dist,preconditioner,iterations,rel_residual,"
-                    "setup_ms,pcg_ms,total_ms,"
-                    "gemm_flops_fp8,gemm_flops_fp16,gemm_flops_tf32,gemm_flops_fp32,gemm_flops_fp64,gemm_flops_total\n");
+                    "setup_ms,pcg_ms,total_ms,fact_time_source,cg_time_source,"
+                    "gemm_flops_fp8,gemm_flops_fp16,gemm_flops_tf32,gemm_flops_fp32,gemm_flops_fp64,gemm_flops_total,"
+                    // INSTRUMENTATION §2 per-run fields:
+                    "run_id,c_underflow,kappa,rhs_spec,solve_tol,max_iters,status,"
+                    "factorization_ok,break_panel,converged,N_iter,achieved_berr,F_S,"
+                    "simulated_construction\n");
         }
     }
- 
-    // ──────────────────────────────────────────────────────────────
-    //  Branch 1: Matrix Market files
-    // ──────────────────────────────────────────────────────────────
+
+    // Per-panel log (INSTRUMENTATION §1).  Default path: derive from csv_path
+    // by inserting "_panel" before the extension.
+    FILE* per_panel_fp = nullptr;
+    {
+        std::string panel_path = cfg.panel_csv_path;
+        if (panel_path.empty() && !cfg.csv_path.empty()) {
+            size_t dot = cfg.csv_path.rfind('.');
+            panel_path = (dot == std::string::npos)
+                       ? cfg.csv_path + "_panel.csv"
+                       : cfg.csv_path.substr(0, dot) + "_panel" + cfg.csv_path.substr(dot);
+        }
+        if (!panel_path.empty()) {
+            cfg.panel_csv_path = panel_path;
+            bool write_header = false;
+            FILE* test = fopen(panel_path.c_str(), "r");
+            if (!test) { write_header = true; }
+            else { fseek(test, 0, SEEK_END); if (ftell(test) == 0) write_header = true; fclose(test); }
+            per_panel_fp = fopen(panel_path.c_str(), "a");
+            if (!per_panel_fp) {
+                fprintf(stderr, "Cannot open per-panel CSV %s\n", panel_path.c_str());
+            } else if (write_header) {
+                fprintf(per_panel_fp,
+                        "run_id,matrix_id,spectrum_type,n,kappa,nb,eps_prime,c_underflow,"
+                        "panel_index,trailing_size,flops_executed,flops_syrk_equiv,"
+                        "selected_precision,mantissa_bits,panel_status\n");
+            }
+        }
+    }
+
+    // Branch 1: Matrix Market files
     if (!cfg.mtx_paths.empty()) {
         for (int mi = 0; mi < (int)cfg.mtx_paths.size(); mi++) {
             const char* mtx_path = cfg.mtx_paths[mi].c_str();
- 
-            // Extract matrix name from path for labels
+
             std::string mtx_name = cfg.mtx_paths[mi];
             size_t slash = mtx_name.rfind('/');
             if (slash != std::string::npos) mtx_name = mtx_name.substr(slash + 1);
             size_t dot = mtx_name.rfind('.');
             if (dot != std::string::npos) mtx_name = mtx_name.substr(0, dot);
- 
-            printf("════════════════════════════════════════════════════════════════\n");
+
+            printf("================================================================\n");
             printf("  Matrix Market: %s\n", mtx_name.c_str());
-            printf("════════════════════════════════════════════════════════════════\n");
- 
+            printf("================================================================\n");
+
             double* d_A64 = nullptr;
             int n = 0;
             int rc = load_mtx_to_dense_f64(mtx_path, &d_A64, &n, cfg.mtx_max_dim);
@@ -3608,47 +3439,41 @@ int main(int argc, char** argv) {
                 printf("  SKIPPING (load failed)\n\n");
                 continue;
             }
- 
-            // Override cfg.n for this matrix (used by workspace allocations inside)
+
             int saved_n = cfg.n;
             cfg.n = n;
- 
-            // For CSV, use "mtx:<name>" as the distribution label
+
             char dist_label[256];
             snprintf(dist_label, sizeof(dist_label), "mtx:%s", mtx_name.c_str());
- 
-            // Set cond to 0 to indicate "unknown" for MTX matrices
+
             double saved_cond = cfg.cond;
             cfg.cond = 0.0;
- 
+
             run_benchmark_on_matrix(d_A64, n, mtx_name.c_str(), dist_label,
                                     cfg, cublas_handle, cusolver_handle,
-                                    stream, csv_fp);
- 
+                                    stream, csv_fp, per_panel_fp);
+
             cfg.n = saved_n;
             cfg.cond = saved_cond;
- 
+
             CUDA_CHECK(cudaFree(d_A64));
             printf("\n");
         }
     }
- 
-    // ──────────────────────────────────────────────────────────────
-    //  Branch 2: Synthetic matrices (only if no MTX files given,
-    //            or always — change the condition below if you want both)
-    // ──────────────────────────────────────────────────────────────
+
+    // Branch 2: Synthetic matrices
     if (cfg.mtx_paths.empty()) {
         int n = cfg.n;
         size_t elems   = (size_t)n * n;
         size_t bytes64 = sizeof(double) * elems;
- 
+
         double* d_A64;
         CUDA_CHECK(cudaMalloc(&d_A64, bytes64));
- 
+
         for (int di = 0; di < NUM_DISTS; di++) {
             eigenvalue_dist_t dist = ALL_DISTS[di];
             const char* dname = dist_name(dist);
- 
+
             char dist_label[128];
             if (dist == DIST_POLY_DECAY || dist == DIST_POWER_LAW)
                 snprintf(dist_label, sizeof(dist_label), "%s(p=%.1f)", dname, cfg.shape_p);
@@ -3656,39 +3481,48 @@ int main(int argc, char** argv) {
                 snprintf(dist_label, sizeof(dist_label), "%s(k=%d)", dname, cfg.num_clusters);
             else
                 snprintf(dist_label, sizeof(dist_label), "%s", dname);
- 
-            printf("════════════════════════════════════════════════════════════════\n");
+
+            printf("================================================================\n");
             printf("  Distribution: %s\n", dist_label);
-            printf("════════════════════════════════════════════════════════════════\n");
- 
+            printf("================================================================\n");
+
             printf("Generating %d x %d SPD matrix (cond=%.1e, dist=%s) ... ",
                    n, n, cfg.cond, dist_label);
             fflush(stdout);
             generate_spd(d_A64, n, n, cfg.cond, dist, cublas_handle,
-                         cusolver_handle, stream, cfg.shape_p, cfg.num_clusters);
+                         cusolver_handle, stream, cfg.shape_p, cfg.num_clusters,
+                         cfg.seed);
             CUDA_CHECK(cudaStreamSynchronize(stream));
             printf("done.\n");
- 
+
             run_benchmark_on_matrix(d_A64, n, dist_label, dname,
                                     cfg, cublas_handle, cusolver_handle,
-                                    stream, csv_fp);
+                                    stream, csv_fp, per_panel_fp);
             printf("\n");
         }
- 
+
         CUDA_CHECK(cudaFree(d_A64));
     }
- 
+
     if (csv_fp) {
         fclose(csv_fp);
-        printf("Results written to: %s\n", cfg.csv_path.c_str());
+        printf("Per-run results written to: %s\n", cfg.csv_path.c_str());
     }
- 
+    if (per_panel_fp) {
+        fclose(per_panel_fp);
+        printf("Per-panel results written to: %s\n", cfg.panel_csv_path.c_str());
+    }
+
     printf("PCG tolerance: %.0e, max iterations: %d\n", cfg.tol, cfg.max_iter);
- 
+
+    // Cleanup cuBLASLt
+    g_fp16_gemm.clear_cache();
+    g_fp8_gemm .clear_cache();
+    g_lt_ctx.destroy();
+
     CUDA_CHECK(cudaStreamDestroy(stream));
     CUBLAS_CHECK(cublasDestroy(cublas_handle));
     CUSOLVER_CHECK(cusolverDnDestroy(cusolver_handle));
- 
+
     return 0;
 }
- 
